@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package kvs;
+
+option go_package = "github.com/noda/linkraft/proto/kvspb";
+
+// KVS はクライアント（API サーバー）向けのキーバリュー操作 RPC。
+// 書き込み系（Set / Delete / Incr）はリーダーのみ受け付け、
+// フォロワーは not_leader = true とリーダーのヒントを返す。
+service KVS {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Incr(IncrRequest) returns (IncrResponse);
+  rpc Keys(KeysRequest) returns (KeysResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+  bool not_leader = 3;
+  string leader_addr = 4;
+}
+
+message SetRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message SetResponse {
+  bool not_leader = 1;
+  string leader_addr = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool not_leader = 1;
+  string leader_addr = 2;
+}
+
+message IncrRequest {
+  string key = 1;
+}
+
+message IncrResponse {
+  int64 value = 1;
+  bool not_leader = 2;
+  string leader_addr = 3;
+}
+
+message KeysRequest {
+  string prefix = 1;
+}
+
+message KeysResponse {
+  repeated string keys = 1;
+  bool not_leader = 2;
+  string leader_addr = 3;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string node_id = 1;
+  // "leader" | "follower" | "candidate"
+  string state = 2;
+  uint64 term = 3;
+  string leader_id = 4;
+  uint64 commit_index = 5;
+  uint64 applied_index = 6;
+  int64 keys_total = 7;
+}

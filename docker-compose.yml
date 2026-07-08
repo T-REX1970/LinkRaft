@@ -1,0 +1,68 @@
+# 開発用: 3 ノード KVS クラスタ + API サーバーを一発起動
+# 使い方: docker compose up --build
+services:
+  kvs-node-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvs
+    command:
+      - -id=node-0
+      - -listen=:9000
+      - -advertise=kvs-node-0:9000
+      - -peers=node-1=kvs-node-1:9000,node-2=kvs-node-2:9000
+      - -data=/data
+    volumes:
+      - kvs-data-0:/data
+    ports:
+      - "9000:9000"
+
+  kvs-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvs
+    command:
+      - -id=node-1
+      - -listen=:9000
+      - -advertise=kvs-node-1:9000
+      - -peers=node-0=kvs-node-0:9000,node-2=kvs-node-2:9000
+      - -data=/data
+    volumes:
+      - kvs-data-1:/data
+    ports:
+      - "9001:9000"
+
+  kvs-node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvs
+    command:
+      - -id=node-2
+      - -listen=:9000
+      - -advertise=kvs-node-2:9000
+      - -peers=node-0=kvs-node-0:9000,node-1=kvs-node-1:9000
+      - -data=/data
+    volumes:
+      - kvs-data-2:/data
+    ports:
+      - "9002:9000"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command:
+      - -addr=:8080
+      - -kvs=kvs-node-0:9000,kvs-node-1:9000,kvs-node-2:9000
+    environment:
+      JWT_SECRET: linkraft-dev-secret
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kvs-node-0
+      - kvs-node-1
+      - kvs-node-2
+
+volumes:
+  kvs-data-0:
+  kvs-data-1:
+  kvs-data-2:

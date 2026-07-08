@@ -1,0 +1,16 @@
+# 分散 KVS ノード
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/kvs ./cmd/kvs
+
+FROM alpine:3.21
+RUN adduser -D -u 10001 linkraft
+USER linkraft
+COPY --from=build /out/kvs /usr/local/bin/kvs
+VOLUME /data
+ENV KVS_DATA_DIR=/data
+EXPOSE 9000
+ENTRYPOINT ["kvs"]

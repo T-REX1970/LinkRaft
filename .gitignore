@@ -1,0 +1,9 @@
+# ビルド成果物
+bin/
+
+# KVS ノードのローカルデータ（WAL / Raft ログ）
+data/
+
+# フロントエンド（フェーズ2以降）
+node_modules/
+web/dist/
