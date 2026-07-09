@@ -1,4 +1,4 @@
-/* LinkRaft — シンプルなライトテーマ */
+/* LinkRaft — ライト / ダーク両対応（prefers-color-scheme 追従） */
 
 :root {
   --bg: #f6f7f9;
@@ -8,8 +8,43 @@
   --border: #d8dde3;
   --primary: #2563eb;
   --primary-dark: #1d4ed8;
+  --primary-text: #1d4ed8;
   --danger: #dc2626;
   --tag-bg: #e8eefb;
+  --overlay: rgba(0, 0, 0, 0.4);
+  --state-leader-bg: #dcfce7;
+  --state-leader-fg: #15803d;
+  --state-follower-bg: #e8eefb;
+  --state-follower-fg: #1d4ed8;
+  --state-candidate-bg: #fef9c3;
+  --state-candidate-fg: #a16207;
+  --state-down-bg: #fee2e2;
+  --state-down-fg: #b91c1c;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181c;
+    --card: #1f242b;
+    --text: #e6e9ed;
+    --muted: #9aa4b0;
+    --border: #363d47;
+    --primary: #3b82f6;
+    --primary-dark: #2563eb;
+    --primary-text: #7ba7f7;
+    --danger: #f87171;
+    --tag-bg: #263752;
+    --overlay: rgba(0, 0, 0, 0.6);
+    --state-leader-bg: #14351f;
+    --state-leader-fg: #4ade80;
+    --state-follower-bg: #1d2c4a;
+    --state-follower-fg: #93b4f5;
+    --state-candidate-bg: #3a3010;
+    --state-candidate-fg: #fbbf24;
+    --state-down-bg: #431b1b;
+    --state-down-fg: #fca5a5;
+  }
 }
 
 * {
@@ -180,6 +215,15 @@ main.container {
   color: var(--primary);
   border-color: var(--primary);
 }
+/* 投票済み: 塗りつぶし表示 */
+.vote-button.voted {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.vote-button.voted .vote-count {
+  color: #fff;
+}
 .vote-count {
   font-weight: 700;
   color: var(--text);
@@ -211,10 +255,33 @@ main.container {
 }
 .tag {
   background: var(--tag-bg);
-  color: var(--primary-dark);
+  color: var(--primary-text);
   border-radius: 4px;
   padding: 1px 8px;
   font-size: 12px;
+}
+
+/* OGP サムネイル */
+.link-thumb {
+  flex: none;
+  width: 96px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  align-self: center;
+}
+.thumb-preview {
+  margin-bottom: 14px;
+}
+.thumb-preview img {
+  display: block;
+  max-width: 240px;
+  max-height: 140px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-bottom: 6px;
 }
 
 /* コメント */
@@ -311,6 +378,41 @@ textarea:focus {
 .error {
   color: var(--danger);
 }
+.notice {
+  background: var(--tag-bg);
+  color: var(--primary-text);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+/* 確認ダイアログ */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.dialog {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 24px;
+  max-width: 400px;
+  width: calc(100% - 48px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.dialog p {
+  margin: 0 0 16px;
+}
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 /* ページネーション */
 .pagination {
@@ -350,18 +452,18 @@ textarea:focus {
   font-weight: 600;
 }
 .state-leader {
-  background: #dcfce7;
-  color: #15803d;
+  background: var(--state-leader-bg);
+  color: var(--state-leader-fg);
 }
 .state-follower {
-  background: #e8eefb;
-  color: #1d4ed8;
+  background: var(--state-follower-bg);
+  color: var(--state-follower-fg);
 }
 .state-candidate {
-  background: #fef9c3;
-  color: #a16207;
+  background: var(--state-candidate-bg);
+  color: var(--state-candidate-fg);
 }
 .state-down {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: var(--state-down-bg);
+  color: var(--state-down-fg);
 }

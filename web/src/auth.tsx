@@ -4,11 +4,18 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useState,
   type ReactNode,
 } from "react";
+import { useNavigate } from "react-router-dom";
 
-import { clearSession, saveSession, savedUser } from "./api";
+import {
+  clearSession,
+  saveSession,
+  savedUser,
+  SESSION_EXPIRED_EVENT,
+} from "./api";
 import type { AuthResponse, PublicUser } from "./types";
 
 interface AuthState {
@@ -25,6 +32,7 @@ const AuthContext = createContext<AuthState>({
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<PublicUser | null>(savedUser);
+  const navigate = useNavigate();
 
   const signIn = useCallback((auth: AuthResponse) => {
     saveSession(auth);
@@ -35,6 +43,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearSession();
     setUser(null);
   }, []);
+
+  // API 層がトークン失効を検知したらログイン画面へ誘導する（401 の一元処理）
+  useEffect(() => {
+    const onExpired = () => {
+      setUser(null);
+      navigate("/login", { state: { expired: true } });
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, [navigate]);
 
   return (
     <AuthContext.Provider value={{ user, signIn, signOut }}>

@@ -1,38 +1,18 @@
-import { Link as RouterLink, useNavigate } from "react-router-dom";
+import { Link as RouterLink } from "react-router-dom";
 
-import { api, ApiError } from "../api";
-import { useAuth } from "../auth";
 import { hostOf, timeAgo } from "../format";
 import type { Link } from "../types";
+import VoteButton from "./VoteButton";
 
 interface Props {
   link: Link;
-  // 投票後に vote_count / voted を反映するためのコールバック
-  onVoted: (linkID: number, voteCount: number) => void;
+  onVoted: (linkID: number, voteCount: number, voted: boolean) => void;
 }
 
 export default function LinkCard({ link, onVoted }: Props) {
-  const { user } = useAuth();
-  const navigate = useNavigate();
-
-  const vote = async () => {
-    if (!user) {
-      navigate("/login");
-      return;
-    }
-    try {
-      const res = await api.toggleVote(link.id);
-      onVoted(link.id, res.vote_count);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) navigate("/login");
-    }
-  };
-
   return (
     <article className="link-card">
-      <button className="vote-button" onClick={vote} title="投票する">
-        ▲<span className="vote-count">{link.vote_count}</span>
-      </button>
+      <VoteButton link={link} onVoted={onVoted} />
       <div className="link-body">
         <div className="link-title-row">
           <a href={link.url} target="_blank" rel="noreferrer" className="link-title">
@@ -57,6 +37,17 @@ export default function LinkCard({ link, onVoted }: Props) {
           </RouterLink>
         </div>
       </div>
+      {link.image_url && (
+        <img
+          className="link-thumb"
+          src={link.image_url}
+          alt=""
+          loading="lazy"
+          onError={(e) => {
+            (e.target as HTMLImageElement).style.display = "none";
+          }}
+        />
+      )}
     </article>
   );
 }

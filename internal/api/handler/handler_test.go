@@ -218,6 +218,54 @@ func TestVoteToggle(t *testing.T) {
 	}
 }
 
+func TestVotedFlagAndImageURL(t *testing.T) {
+	e := newTestServer(t)
+	alice := signup(t, e, "alice", "alice@example.com")
+	bob := signup(t, e, "bob", "bob@example.com")
+
+	// image_url 付きで投稿
+	rec := doJSON(e, http.MethodPost, "/api/links",
+		`{"url":"https://example.com","title":"t","image_url":"https://example.com/ogp.png"}`, alice)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	// 不正な image_url は 400
+	rec = doJSON(e, http.MethodPost, "/api/links",
+		`{"url":"https://example.com/2","title":"t2","image_url":"javascript:alert(1)"}`, alice)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad image_url = %d, want 400", rec.Code)
+	}
+
+	doJSON(e, http.MethodPost, "/api/links/1/vote", "", alice)
+
+	link := func(rec *httptest.ResponseRecorder) map[string]any {
+		return decode(t, rec)["links"].([]any)[0].(map[string]any)
+	}
+	// 投票者本人には voted=true、image_url も返る
+	rec = doJSON(e, http.MethodGet, "/api/links", "", alice)
+	if l := link(rec); l["voted"] != true || l["image_url"] != "https://example.com/ogp.png" {
+		t.Fatalf("alice list: voted=%v image_url=%v", l["voted"], l["image_url"])
+	}
+	// 未投票ユーザーと未ログインには voted=false
+	rec = doJSON(e, http.MethodGet, "/api/links", "", bob)
+	if l := link(rec); l["voted"] != false {
+		t.Fatalf("bob list: voted=%v, want false", l["voted"])
+	}
+	rec = doJSON(e, http.MethodGet, "/api/links", "", "")
+	if l := link(rec); l["voted"] != false {
+		t.Fatalf("anonymous list: voted=%v, want false", l["voted"])
+	}
+	// 詳細とプロフィールにも voted が付く
+	rec = doJSON(e, http.MethodGet, "/api/links/1", "", alice)
+	if l := decode(t, rec)["link"].(map[string]any); l["voted"] != true {
+		t.Fatalf("detail: voted=%v, want true", l["voted"])
+	}
+	rec = doJSON(e, http.MethodGet, "/api/users/1", "", alice)
+	if l := decode(t, rec)["links"].([]any)[0].(map[string]any); l["voted"] != true {
+		t.Fatalf("profile: voted=%v, want true", l["voted"])
+	}
+}
+
 func TestComments(t *testing.T) {
 	e := newTestServer(t)
 	token := signup(t, e, "alice", "alice@example.com")

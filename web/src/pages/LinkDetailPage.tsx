@@ -1,10 +1,19 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
 
-import { api, ApiError } from "../api";
+import { api } from "../api";
 import { useAuth } from "../auth";
+import ConfirmDialog from "../components/ConfirmDialog";
+import VoteButton from "../components/VoteButton";
 import { hostOf, timeAgo } from "../format";
 import type { Comment, Link } from "../types";
+import { usePageTitle } from "../usePageTitle";
+
+// 確認ダイアログで実行する削除操作
+interface PendingDelete {
+  message: string;
+  run: () => Promise<void>;
+}
 
 export default function LinkDetailPage() {
   const { id } = useParams();
@@ -15,6 +24,9 @@ export default function LinkDetailPage() {
   const [link, setLink] = useState<Link | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
   const [error, setError] = useState("");
+  const [pending, setPending] = useState<PendingDelete | null>(null);
+
+  usePageTitle(link?.title ?? "");
 
   const reload = useCallback(async () => {
     try {
@@ -34,21 +46,23 @@ export default function LinkDetailPage() {
     void reload();
   }, [reload]);
 
-  const vote = async () => {
-    if (!user) return navigate("/login");
-    try {
-      const res = await api.toggleVote(linkID);
-      setLink((prev) => (prev ? { ...prev, vote_count: res.vote_count } : prev));
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) navigate("/login");
-    }
-  };
+  const confirmDeleteLink = () =>
+    setPending({
+      message: "このリンクを削除しますか？コメントもすべて削除されます。",
+      run: async () => {
+        await api.deleteLink(linkID);
+        navigate("/");
+      },
+    });
 
-  const removeLink = async () => {
-    if (!window.confirm("このリンクを削除しますか？")) return;
-    await api.deleteLink(linkID);
-    navigate("/");
-  };
+  const confirmDeleteComment = (commentID: number) =>
+    setPending({
+      message: "このコメントを削除しますか？",
+      run: async () => {
+        await api.deleteComment(commentID);
+        await reload();
+      },
+    });
 
   if (error) return <p className="error">{error}</p>;
   if (!link) return <p>読み込み中…</p>;
@@ -59,9 +73,14 @@ export default function LinkDetailPage() {
   return (
     <div>
       <article className="link-card detail">
-        <button className="vote-button" onClick={vote} title="投票する">
-          ▲<span className="vote-count">{link.vote_count}</span>
-        </button>
+        <VoteButton
+          link={link}
+          onVoted={(_, count, voted) =>
+            setLink((prev) =>
+              prev ? { ...prev, vote_count: count, voted } : prev,
+            )
+          }
+        />
         <div className="link-body">
           <div className="link-title-row">
             <a href={link.url} target="_blank" rel="noreferrer" className="link-title">
@@ -82,12 +101,22 @@ export default function LinkDetailPage() {
             </span>
             <span>{timeAgo(link.created_at)}</span>
             {user?.id === link.user_id && (
-              <button className="button danger small" onClick={removeLink}>
+              <button className="button danger small" onClick={confirmDeleteLink}>
                 削除
               </button>
             )}
           </div>
         </div>
+        {link.image_url && (
+          <img
+            className="link-thumb"
+            src={link.image_url}
+            alt=""
+            onError={(e) => {
+              (e.target as HTMLImageElement).style.display = "none";
+            }}
+          />
+        )}
       </article>
 
       <section className="comments">
@@ -105,10 +134,27 @@ export default function LinkDetailPage() {
             comment={c}
             replies={repliesOf(c.id)}
             linkID={linkID}
+            onDelete={confirmDeleteComment}
             onChanged={reload}
           />
         ))}
       </section>
+
+      <ConfirmDialog
+        open={pending !== null}
+        message={pending?.message ?? ""}
+        onCancel={() => setPending(null)}
+        onConfirm={async () => {
+          const p = pending;
+          setPending(null);
+          if (!p) return;
+          try {
+            await p.run();
+          } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        }}
+      />
     </div>
   );
 }
@@ -117,21 +163,17 @@ function CommentItem({
   comment,
   replies,
   linkID,
+  onDelete,
   onChanged,
 }: {
   comment: Comment;
   replies: Comment[];
   linkID: number;
+  onDelete: (commentID: number) => void;
   onChanged: () => Promise<void>;
 }) {
   const { user } = useAuth();
   const [replying, setReplying] = useState(false);
-
-  const remove = async (id: number) => {
-    if (!window.confirm("このコメントを削除しますか？")) return;
-    await api.deleteComment(id);
-    await onChanged();
-  };
 
   return (
     <div className="comment">
@@ -139,7 +181,7 @@ function CommentItem({
         <RouterLink to={`/users/${comment.user_id}`}>{comment.user_name}</RouterLink>
         <span className="comment-time">{timeAgo(comment.created_at)}</span>
         {user?.id === comment.user_id && (
-          <button className="button ghost small" onClick={() => remove(comment.id)}>
+          <button className="button ghost small" onClick={() => onDelete(comment.id)}>
             削除
           </button>
         )}
@@ -168,7 +210,7 @@ function CommentItem({
                 <RouterLink to={`/users/${r.user_id}`}>{r.user_name}</RouterLink>
                 <span className="comment-time">{timeAgo(r.created_at)}</span>
                 {user?.id === r.user_id && (
-                  <button className="button ghost small" onClick={() => remove(r.id)}>
+                  <button className="button ghost small" onClick={() => onDelete(r.id)}>
                     削除
                   </button>
                 )}

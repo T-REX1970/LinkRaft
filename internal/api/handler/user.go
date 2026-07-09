@@ -5,6 +5,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/noda/linkraft/internal/api/middleware"
 	"github.com/noda/linkraft/internal/model"
 )
 
@@ -37,9 +38,13 @@ func (h *Handler) GetUser(c echo.Context) error {
 	for _, l := range links {
 		totalVotes += l.VoteCount
 	}
+	views, err := h.withVoted(ctx, links, middleware.UserID(c))
+	if err != nil {
+		return err
+	}
 	return c.JSON(http.StatusOK, echo.Map{
 		"user":        user.Public(),
-		"links":       links,
+		"links":       views,
 		"total_votes": totalVotes,
 	})
 }

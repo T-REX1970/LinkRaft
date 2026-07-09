@@ -1,5 +1,8 @@
 // Go API (/api/*) への薄い fetch ラッパー。
+// 認証切れ（401）はここで一元処理し、セッションを破棄して
+// "linkraft:session-expired" イベントを発火する（AuthProvider が購読）。
 
+import { translateError } from "./errors";
 import type {
   AuthResponse,
   Comment,
@@ -45,6 +48,8 @@ export class ApiError extends Error {
   }
 }
 
+export const SESSION_EXPIRED_EVENT = "linkraft:session-expired";
+
 async function request<T>(
   method: string,
   path: string,
@@ -70,11 +75,17 @@ async function request<T>(
     data = {};
   }
   if (!res.ok) {
+    // トークンが無効になった（期限切れなど）: セッションを破棄してログインへ誘導。
+    // ログイン・サインアップ自体の 401 は通常のエラーとして呼び出し元に返す。
+    if (res.status === 401 && token && !path.startsWith("/api/auth/")) {
+      clearSession();
+      window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+    }
     const msg =
       typeof data === "object" && data !== null && "message" in data
         ? String((data as { message: unknown }).message)
         : res.statusText;
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, translateError(msg, res.status));
   }
   return data as T;
 }
@@ -105,6 +116,7 @@ export const api = {
     url: string;
     title: string;
     description: string;
+    image_url: string;
     tags: string[];
   }) => request<{ link: Link }>("POST", "/api/links", input),
   deleteLink: (id: number) => request<void>("DELETE", `/api/links/${id}`),

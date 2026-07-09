@@ -96,13 +96,13 @@ export default function HomePage() {
         <LinkCard
           key={l.id}
           link={l}
-          onVoted={(id, count) =>
+          onVoted={(id, count, voted) =>
             setData((prev) =>
               prev
                 ? {
                     ...prev,
                     links: prev.links.map((x) =>
-                      x.id === id ? { ...x, vote_count: count } : x,
+                      x.id === id ? { ...x, vote_count: count, voted } : x,
                     ),
                   }
                 : prev,

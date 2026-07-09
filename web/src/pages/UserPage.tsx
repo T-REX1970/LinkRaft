@@ -4,12 +4,15 @@ import { useParams } from "react-router-dom";
 import { api } from "../api";
 import LinkCard from "../components/LinkCard";
 import type { UserProfileResponse } from "../types";
+import { usePageTitle } from "../usePageTitle";
 
 export default function UserPage() {
   const { id } = useParams();
   const userID = Number(id);
   const [data, setData] = useState<UserProfileResponse | null>(null);
   const [error, setError] = useState("");
+
+  usePageTitle(data?.user.name ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -41,13 +44,13 @@ export default function UserPage() {
         <LinkCard
           key={l.id}
           link={l}
-          onVoted={(linkID, count) =>
+          onVoted={(linkID, count, voted) =>
             setData((prev) =>
               prev
                 ? {
                     ...prev,
                     links: prev.links.map((x) =>
-                      x.id === linkID ? { ...x, vote_count: count } : x,
+                      x.id === linkID ? { ...x, vote_count: count, voted } : x,
                     ),
                   }
                 : prev,

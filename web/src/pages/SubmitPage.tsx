@@ -3,6 +3,7 @@ import { Navigate, useNavigate } from "react-router-dom";
 
 import { api } from "../api";
 import { useAuth } from "../auth";
+import { usePageTitle } from "../usePageTitle";
 
 export default function SubmitPage() {
   const { user } = useAuth();
@@ -11,14 +12,17 @@ export default function SubmitPage() {
   const [url, setUrl] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [imageURL, setImageURL] = useState("");
   const [tagsInput, setTagsInput] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [fetching, setFetching] = useState(false);
 
+  usePageTitle("リンクを投稿");
+
   if (!user) return <Navigate to="/login" replace />;
 
-  // URL から OGP を取得してタイトル・説明をプリフィルする
+  // URL から OGP を取得してタイトル・説明・サムネイルをプリフィルする
   const prefill = async () => {
     if (!url.trim()) return;
     setFetching(true);
@@ -27,6 +31,7 @@ export default function SubmitPage() {
       if (ogp.title && !title) setTitle(ogp.title.slice(0, 200));
       if (ogp.description && !description)
         setDescription(ogp.description.slice(0, 1000));
+      if (ogp.image && !imageURL) setImageURL(ogp.image.slice(0, 2000));
       setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -47,6 +52,7 @@ export default function SubmitPage() {
         url: url.trim(),
         title: title.trim(),
         description: description.trim(),
+        image_url: imageURL.trim(),
         tags,
       });
       navigate(`/links/${res.link.id}`);
@@ -107,6 +113,22 @@ export default function SubmitPage() {
             placeholder="go raft distributed-systems"
           />
         </label>
+        {imageURL && (
+          <div className="thumb-preview">
+            <img
+              src={imageURL}
+              alt="サムネイルプレビュー"
+              onError={() => setImageURL("")}
+            />
+            <button
+              type="button"
+              className="button ghost small"
+              onClick={() => setImageURL("")}
+            >
+              サムネイルを外す
+            </button>
+          </div>
+        )}
         {error && <p className="error">{error}</p>}
         <button className="button primary" disabled={busy}>
           {busy ? "投稿中…" : "投稿する"}

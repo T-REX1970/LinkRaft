@@ -2,12 +2,15 @@ import { useEffect, useState } from "react";
 
 import { api } from "../api";
 import type { HealthResponse } from "../types";
+import { usePageTitle } from "../usePageTitle";
 
 // KVS クラスタの状態を 2 秒間隔でポーリング表示する。
 // リーダーを kill すると再選出される様子がここで観察できる。
 export default function HealthPage() {
   const [data, setData] = useState<HealthResponse | null>(null);
   const [error, setError] = useState("");
+
+  usePageTitle("クラスタ状態");
 
   useEffect(() => {
     let cancelled = false;

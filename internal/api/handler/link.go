@@ -22,14 +22,21 @@ type createLinkRequest struct {
 	URL         string   `json:"url"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
+	ImageURL    string   `json:"image_url"`
 	Tags        []string `json:"tags"`
 }
 
+// linkView はレスポンス用のリンク表現。閲覧者が投票済みかどうかを付与する。
+type linkView struct {
+	model.Link
+	Voted bool `json:"voted"`
+}
+
 type linkListResponse struct {
-	Links   []model.Link `json:"links"`
-	Total   int          `json:"total"`
-	Page    int          `json:"page"`
-	PerPage int          `json:"per_page"`
+	Links   []linkView `json:"links"`
+	Total   int        `json:"total"`
+	Page    int        `json:"page"`
+	PerPage int        `json:"per_page"`
 }
 
 // ListLinks は GET /api/links。?sort=recent|popular &tag= &q= &page= &per_page=
@@ -97,8 +104,12 @@ func (h *Handler) ListLinks(c echo.Context) error {
 	if end > total {
 		end = total
 	}
+	views, err := h.withVoted(ctx, links[start:end], middleware.UserID(c))
+	if err != nil {
+		return err
+	}
 	return c.JSON(http.StatusOK, linkListResponse{
-		Links: links[start:end], Total: total, Page: page, PerPage: perPage,
+		Links: views, Total: total, Page: page, PerPage: perPage,
 	})
 }
 
@@ -117,6 +128,23 @@ func (h *Handler) fetchLinks(ctx context.Context, ids []int64) ([]model.Link, er
 	return links, nil
 }
 
+// withVoted はリンク一覧に「閲覧者が投票済みか」を付与する。未ログインなら常に false。
+func (h *Handler) withVoted(ctx context.Context, links []model.Link, userID int64) ([]linkView, error) {
+	views := make([]linkView, 0, len(links))
+	for _, l := range links {
+		v := linkView{Link: l}
+		if userID != 0 {
+			_, voted, err := h.repo.kv.Get(ctx, voteKey(l.ID, userID))
+			if err != nil {
+				return nil, err
+			}
+			v.Voted = voted
+		}
+		views = append(views, v)
+	}
+	return views, nil
+}
+
 // CreateLink は POST /api/links（要認証）。
 func (h *Handler) CreateLink(c echo.Context) error {
 	var req createLinkRequest
@@ -129,6 +157,13 @@ func (h *Handler) CreateLink(c echo.Context) error {
 	u, err := url.Parse(strings.TrimSpace(req.URL))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "url must be a valid http(s) URL")
+	}
+	req.ImageURL = strings.TrimSpace(req.ImageURL)
+	if req.ImageURL != "" {
+		iu, err := url.Parse(req.ImageURL)
+		if err != nil || (iu.Scheme != "http" && iu.Scheme != "https") || iu.Host == "" || len(req.ImageURL) > 2000 {
+			return echo.NewHTTPError(http.StatusBadRequest, "image_url must be a valid http(s) URL")
+		}
 	}
 	if req.Title == "" || utf8.RuneCountInString(req.Title) > 200 {
 		return echo.NewHTTPError(http.StatusBadRequest, "title must be 1-200 characters")
@@ -162,6 +197,7 @@ func (h *Handler) CreateLink(c echo.Context) error {
 		URL:         u.String(),
 		Title:       req.Title,
 		Description: req.Description,
+		ImageURL:    req.ImageURL,
 		UserID:      middleware.UserID(c),
 		UserName:    middleware.UserName(c),
 		Tags:        tags,
@@ -184,7 +220,7 @@ func (h *Handler) CreateLink(c echo.Context) error {
 			return err
 		}
 	}
-	return c.JSON(http.StatusCreated, echo.Map{"link": link})
+	return c.JSON(http.StatusCreated, echo.Map{"link": linkView{Link: link}})
 }
 
 // GetLink は GET /api/links/:id。
@@ -193,15 +229,20 @@ func (h *Handler) GetLink(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	ctx := c.Request().Context()
 	var link model.Link
-	found, err := h.repo.GetJSON(c.Request().Context(), linkKey(id), &link)
+	found, err := h.repo.GetJSON(ctx, linkKey(id), &link)
 	if err != nil {
 		return err
 	}
 	if !found {
 		return echo.NewHTTPError(http.StatusNotFound, "link not found")
 	}
-	return c.JSON(http.StatusOK, echo.Map{"link": link})
+	views, err := h.withVoted(ctx, []model.Link{link}, middleware.UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, echo.Map{"link": views[0]})
 }
 
 // DeleteLink は DELETE /api/links/:id（本人のみ、要認証）。

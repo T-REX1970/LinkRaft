@@ -9,6 +9,7 @@ type Link struct {
 	URL          string    `json:"url"`
 	Title        string    `json:"title"`
 	Description  string    `json:"description"`
+	ImageURL     string    `json:"image_url"` // OGP 画像（サムネイル表示用、任意）
 	UserID       int64     `json:"user_id"`
 	UserName     string    `json:"user_name"`
 	Tags         []string  `json:"tags"`

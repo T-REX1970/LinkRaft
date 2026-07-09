@@ -49,14 +49,8 @@ func JWT(secret []byte) echo.MiddlewareFunc {
 			if !ok || token == "" {
 				return echo.NewHTTPError(http.StatusUnauthorized, "missing bearer token")
 			}
-			claims := &Claims{}
-			parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
-				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-				}
-				return secret, nil
-			})
-			if err != nil || !parsed.Valid {
+			claims, err := parseToken(secret, token)
+			if err != nil {
 				return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 			}
 			c.Set(ctxUserID, claims.UserID)
@@ -64,6 +58,38 @@ func JWT(secret []byte) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// JWTOptional は公開エンドポイント用。有効なトークンがあればユーザー情報を
+// コンテキストにセットし、なくてもエラーにしない（voted フラグなどの
+// 閲覧者依存の情報に使う）。
+func JWTOptional(secret []byte) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			auth := c.Request().Header.Get(echo.HeaderAuthorization)
+			if token, ok := strings.CutPrefix(auth, "Bearer "); ok && token != "" {
+				if claims, err := parseToken(secret, token); err == nil {
+					c.Set(ctxUserID, claims.UserID)
+					c.Set(ctxUserName, claims.UserName)
+				}
+			}
+			return next(c)
+		}
+	}
+}
+
+func parseToken(secret []byte, token string) (*Claims, error) {
+	claims := &Claims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return secret, nil
+	})
+	if err != nil || !parsed.Valid {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	return claims, nil
 }
 
 // UserID は JWT ミドルウェアがセットした認証済みユーザー ID を返す。

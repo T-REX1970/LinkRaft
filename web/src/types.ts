@@ -11,12 +11,14 @@ export interface Link {
   url: string;
   title: string;
   description: string;
+  image_url: string;
   user_id: number;
   user_name: string;
   tags: string[];
   vote_count: number;
   comment_count: number;
   created_at: string;
+  voted: boolean; // 閲覧者が投票済みか（未ログイン時は常に false）
 }
 
 export interface Comment {

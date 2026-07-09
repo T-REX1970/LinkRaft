@@ -35,7 +35,8 @@ func NewRouter(h *handler.Handler, jwtSecret []byte, webDir string) *echo.Echo {
 		}
 	}
 
-	pub := e.Group("/api")
+	// 公開エンドポイントでもトークンがあれば閲覧者を識別する（voted フラグ用）
+	pub := e.Group("/api", middleware.JWTOptional(jwtSecret))
 	pub.POST("/auth/signup", h.Signup)
 	pub.POST("/auth/login", h.Login)
 	pub.GET("/links", h.ListLinks)
