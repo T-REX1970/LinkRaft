@@ -8,6 +8,7 @@ option go_package = "github.com/noda/linkraft/proto/raftpb";
 service Raft {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 // LogEntry は複製されるログエントリ。
@@ -43,4 +44,18 @@ message AppendEntriesResponse {
   bool success = 2;
   // success 時にフォロワーが複製済みの最後のインデックス
   uint64 match_index = 3;
+}
+
+// InstallSnapshot はログを持たない範囲まで遅れたフォロワーへ
+// ステートマシンのスナップショットを転送する（チャンク分割なしの簡易版）。
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
 }

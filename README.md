@@ -5,11 +5,11 @@
 
 全体設計・データ設計・実装フェーズは [claude.md](./claude.md) を参照。
 
-## 構成（Go アプリケーション）
+## 構成
 
 ```
 cmd/
-├── api/    # Echo REST API サーバー（:8080）
+├── api/    # Echo REST API サーバー（:8080、web/dist があれば SPA も配信）
 └── kvs/    # 分散 KVS ノード（gRPC, :9000〜）
 internal/
 ├── api/    # ルーティング・ハンドラー・JWT ミドルウェア
@@ -17,27 +17,40 @@ internal/
 ├── raft/   # Raft（リーダー選出・ログ複製・gRPC トランスポート）
 └── model/  # ドメインモデル（User / Link / Vote / Comment）
 proto/      # kvs.proto / raft.proto と生成コード
+web/        # フロントエンド SPA（Vite + React + TypeScript）
 ```
 
 - 書き込み（Set / Delete / Incr）はリーダーで Raft 合意を取ってから適用
 - フォロワーに書き込むとリーダーのアドレスヒントが返り、API 側クライアントが自動で追従
 - 各ノードは WAL と Raft ログをディスクに永続化し、再起動時に復元・キャッチアップする
+- 一定数のエントリ適用ごとにスナップショットを取り、Raft ログと WAL を切り詰める
+  （`-snapshot-threshold`、デフォルト 1000）。大きく遅れたノードには
+  InstallSnapshot RPC でスナップショットごと転送して追いつかせる
 
 ## 起動方法（ローカル）
 
 ターミナルを 4 つ使う場合:
 
 ```sh
+make web         # 最初に一度: フロントエンドを web/dist にビルド
 make run-kvs-0   # ターミナル 1
 make run-kvs-1   # ターミナル 2
 make run-kvs-2   # ターミナル 3
 make run-api     # ターミナル 4
 ```
 
-または Docker Compose で一発起動:
+http://localhost:8080 で Web UI が開ける（`web/dist` がなければ API のみ）。
+
+または Docker Compose で一発起動（フロントエンドのビルドも含む）:
 
 ```sh
 docker compose up --build
+```
+
+### フロントエンド開発
+
+```sh
+make web-dev   # Vite dev server (:5173)。/api は :8080 にプロキシされる
 ```
 
 ## 動作確認
@@ -76,6 +89,7 @@ curl -s localhost:8080/api/health   # リーダーを確認して kill してみ
 make test    # go test -race ./...
 make vet     # go vet
 make build   # bin/api, bin/kvs をビルド
+make web     # フロントエンドを web/dist にビルド
 make proto   # .proto から Go コードを再生成（protoc が必要）
 ```
 

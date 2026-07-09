@@ -1,5 +1,6 @@
 // Package raft は Raft 合意アルゴリズムの学習用実装。
-// リーダー選出とログ複製を実装する。スナップショットとメンバー変更は未対応。
+// リーダー選出・ログ複製・スナップショット（ログコンパクション）を実装する。
+// メンバーシップ変更は未対応。
 package raft
 
 import (
@@ -48,6 +49,11 @@ type Config struct {
 	// ステートマシンが適用済みのインデックス（再起動時の重複適用回避に使う）
 	AppliedIndex uint64
 
+	// Snapshotter を与えると、適用済みエントリが SnapshotThreshold を超えるたびに
+	// スナップショットを取得してログをコンパクションする。
+	Snapshotter       Snapshotter
+	SnapshotThreshold uint64 // デフォルト 1000 エントリ
+
 	Logger *slog.Logger
 }
 
@@ -90,6 +96,11 @@ type Node struct {
 	applyFn  ApplyFunc
 	waiters  map[uint64]chan applyResult
 
+	snapshotter       Snapshotter
+	snapshotThreshold uint64
+	dataDir           string
+	snapInFlight      map[string]bool // InstallSnapshot 送信中のピア
+
 	metaPath string
 	applyCh  chan struct{}
 	stopCh   chan struct{}
@@ -115,6 +126,9 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = 50 * time.Millisecond
 	}
+	if cfg.SnapshotThreshold == 0 {
+		cfg.SnapshotThreshold = 1000
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -124,7 +138,14 @@ func NewNode(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	lg, err := OpenLog(filepath.Join(cfg.DataDir, "raft-log.jsonl"))
+	// スナップショットがあればその境界からログを復元する
+	var snapIndex, snapTerm uint64
+	if snap, err := LoadSnapshot(cfg.DataDir); err != nil {
+		return nil, err
+	} else if snap != nil {
+		snapIndex, snapTerm = snap.Index, snap.Term
+	}
+	lg, err := OpenLog(filepath.Join(cfg.DataDir, "raft-log.jsonl"), snapIndex, snapTerm)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +157,12 @@ func NewNode(cfg Config) (*Node, error) {
 		ownTrans = true
 	}
 
+	// スナップショットの方が進んでいる場合はそちらに合わせる
+	applied := cfg.AppliedIndex
+	if snapIndex > applied {
+		applied = snapIndex
+	}
+
 	n := &Node{
 		id:                 cfg.ID,
 		addr:               cfg.Addr,
@@ -144,8 +171,8 @@ func NewNode(cfg Config) (*Node, error) {
 		currentTerm:        m.Term,
 		votedFor:           m.VotedFor,
 		log:                lg,
-		lastApplied:        cfg.AppliedIndex,
-		commitIndex:        cfg.AppliedIndex,
+		lastApplied:        applied,
+		commitIndex:        applied,
 		heartbeatInterval:  cfg.HeartbeatInterval,
 		electionTimeoutMin: cfg.ElectionTimeoutMin,
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
@@ -153,6 +180,10 @@ func NewNode(cfg Config) (*Node, error) {
 		ownTrans:           ownTrans,
 		applyFn:            cfg.Apply,
 		waiters:            make(map[uint64]chan applyResult),
+		snapshotter:        cfg.Snapshotter,
+		snapshotThreshold:  cfg.SnapshotThreshold,
+		dataDir:            cfg.DataDir,
+		snapInFlight:       make(map[string]bool),
 		metaPath:           metaPath,
 		applyCh:            make(chan struct{}, 1),
 		stopCh:             make(chan struct{}),
@@ -203,6 +234,7 @@ type Status struct {
 	LeaderAddr     string
 	CommitIndex    uint64
 	AppliedIndex   uint64
+	SnapshotIndex  uint64 // ログコンパクション済みの境界（なければ 0）
 	ElectionsTotal uint64
 	Peers          int
 }
@@ -219,6 +251,7 @@ func (n *Node) GetStatus() Status {
 		LeaderAddr:     n.leaderAddrLocked(),
 		CommitIndex:    n.commitIndex,
 		AppliedIndex:   n.lastApplied,
+		SnapshotIndex:  n.log.SnapIndex(),
 		ElectionsTotal: n.electionsTotal,
 		Peers:          n.clusterSize(),
 	}
@@ -421,6 +454,15 @@ func (n *Node) sendAppend(peerID string, term uint64) {
 		return
 	}
 	next := n.nextIndex[peerID]
+	// 必要なエントリがコンパクション済みならスナップショットを転送する
+	if next <= n.log.SnapIndex() {
+		if !n.snapInFlight[peerID] {
+			n.snapInFlight[peerID] = true
+			go n.sendSnapshot(peerID, term)
+		}
+		n.mu.Unlock()
+		return
+	}
 	prevIndex := next - 1
 	req := &raftpb.AppendEntriesRequest{
 		Term:         term,
@@ -468,6 +510,99 @@ func (n *Node) sendAppend(peerID string, term uint64) {
 		newNext = 1
 	}
 	n.nextIndex[peerID] = newNext
+}
+
+// ---- スナップショット ----
+
+// sendSnapshot はディスク上のスナップショットをピアに転送する。
+// 成功したら matchIndex / nextIndex をスナップショット境界まで進める。
+func (n *Node) sendSnapshot(peerID string, term uint64) {
+	defer func() {
+		n.mu.Lock()
+		delete(n.snapInFlight, peerID)
+		n.mu.Unlock()
+	}()
+
+	snap, err := LoadSnapshot(n.dataDir)
+	if err != nil || snap == nil {
+		n.logger.Error("failed to load snapshot for peer", "peer", peerID, "err", err)
+		return
+	}
+	req := &raftpb.InstallSnapshotRequest{
+		Term:              term,
+		LeaderId:          n.id,
+		LastIncludedIndex: snap.Index,
+		LastIncludedTerm:  snap.Term,
+		Data:              snap.Data,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := n.trans.InstallSnapshot(ctx, peerID, req)
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if resp.Term > n.currentTerm {
+		n.becomeFollowerLocked(resp.Term)
+		return
+	}
+	if n.state != Leader || n.currentTerm != term {
+		return
+	}
+	if snap.Index > n.matchIndex[peerID] {
+		n.matchIndex[peerID] = snap.Index
+	}
+	n.nextIndex[peerID] = n.matchIndex[peerID] + 1
+	n.logger.Info("snapshot installed on peer", "peer", peerID, "index", snap.Index)
+}
+
+// maybeSnapshotLocked 相当の判定＋実行。applyLoop からエントリ適用後に呼ばれる。
+// スナップショット境界から SnapshotThreshold エントリ以上適用が進んでいたら、
+// ステートマシンの状態を永続化してログをコンパクションする。
+func (n *Node) maybeSnapshot() {
+	if n.snapshotter == nil {
+		return
+	}
+	n.mu.Lock()
+	idx := n.lastApplied
+	if idx == 0 || idx-n.log.SnapIndex() < n.snapshotThreshold {
+		n.mu.Unlock()
+		return
+	}
+	term := n.log.TermAt(idx)
+	n.mu.Unlock()
+	if term == 0 {
+		return
+	}
+
+	// applyLoop はこのスナップショットが終わるまで次のエントリを適用しないため、
+	// ここで取得する状態は lastApplied ちょうどの内容になる。
+	data, err := n.snapshotter.Snapshot()
+	if err != nil {
+		n.logger.Error("failed to serialize state machine", "err", err)
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if idx <= n.log.SnapIndex() { // InstallSnapshot で先にコンパクション済み
+		return
+	}
+	if err := SaveSnapshot(n.dataDir, &Snapshot{Index: idx, Term: term, Data: data}); err != nil {
+		n.logger.Error("failed to save snapshot", "err", err)
+		return
+	}
+	if err := n.log.CompactTo(idx, term); err != nil {
+		n.logger.Error("failed to compact raft log", "err", err)
+		return
+	}
+	if err := n.snapshotter.Compacted(idx); err != nil {
+		n.logger.Error("failed to compact state machine wal", "err", err)
+	}
+	n.logger.Info("snapshot taken", "index", idx, "term", term)
 }
 
 // advanceCommitLocked は過半数に複製されたエントリまで commitIndex を進める。
@@ -556,6 +691,8 @@ func (n *Node) handleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	for _, pe := range req.Entries {
 		e := Entry{Term: pe.Term, Index: pe.Index, Command: pe.Command}
 		switch {
+		case e.Index <= n.log.SnapIndex():
+			// スナップショットでカバー済み（コミット済みなので一致が保証される）
 		case e.Index <= n.log.LastIndex() && n.log.TermAt(e.Index) == e.Term:
 			// 既に持っている
 		case e.Index <= n.log.LastIndex():
@@ -583,6 +720,52 @@ func (n *Node) handleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 
 	resp.Success = true
 	resp.MatchIndex = req.PrevLogIndex + uint64(len(req.Entries))
+	return resp
+}
+
+func (n *Node) handleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb.InstallSnapshotResponse {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	resp := &raftpb.InstallSnapshotResponse{Term: n.currentTerm}
+	if req.Term < n.currentTerm {
+		return resp
+	}
+	if req.Term > n.currentTerm || n.state != Follower {
+		n.becomeFollowerLocked(req.Term)
+	}
+	resp.Term = n.currentTerm
+	n.leaderID = req.LeaderId
+	n.electionReset = time.Now()
+
+	// 既にカバー済みの範囲なら何もしない（成功として返し、リーダーは
+	// nextIndex を境界+1 に進めて通常の複製に戻る）
+	if req.LastIncludedIndex <= n.commitIndex {
+		return resp
+	}
+	if n.snapshotter == nil {
+		n.logger.Error("received snapshot but no snapshotter configured")
+		return resp
+	}
+
+	// 先に自分のスナップショットとして永続化してから状態を置き換える。
+	// 途中でクラッシュしても再起動時にスナップショットから復元できる。
+	snap := &Snapshot{Index: req.LastIncludedIndex, Term: req.LastIncludedTerm, Data: req.Data}
+	if err := SaveSnapshot(n.dataDir, snap); err != nil {
+		n.logger.Error("failed to save received snapshot", "err", err)
+		return resp
+	}
+	if err := n.snapshotter.Restore(req.LastIncludedIndex, req.Data); err != nil {
+		n.logger.Error("failed to restore state machine from snapshot", "err", err)
+		return resp
+	}
+	if err := n.log.CompactTo(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
+		n.logger.Error("failed to compact raft log after snapshot", "err", err)
+	}
+	n.commitIndex = req.LastIncludedIndex
+	n.lastApplied = req.LastIncludedIndex
+	n.logger.Info("installed snapshot from leader",
+		"leader", req.LeaderId, "index", req.LastIncludedIndex, "term", req.LastIncludedTerm)
 	return resp
 }
 
@@ -621,6 +804,7 @@ func (n *Node) applyLoop() {
 			if waiter != nil {
 				waiter <- applyResult{res: res, err: err}
 			}
+			n.maybeSnapshot()
 		}
 	}
 }

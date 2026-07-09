@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -35,17 +36,18 @@ func main() {
 		advertise = flag.String("advertise", envOr("KVS_ADVERTISE", "localhost:9000"), "他ノード・クライアントへ広報するアドレス")
 		peersFlag = flag.String("peers", envOr("KVS_PEERS", ""), "他ノード一覧 (id=addr,id=addr)")
 		dataDir   = flag.String("data", envOr("KVS_DATA_DIR", "./data"), "WAL / Raft ログの保存先")
+		snapEvery = flag.Uint64("snapshot-threshold", envUint("KVS_SNAPSHOT_THRESHOLD", 1000), "この数のエントリを適用するごとにスナップショットを取る")
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*id, *listen, *advertise, *peersFlag, *dataDir, logger); err != nil {
+	if err := run(*id, *listen, *advertise, *peersFlag, *dataDir, *snapEvery, logger); err != nil {
 		logger.Error("kvs node exited with error", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(id, listen, advertise, peersFlag, dataDir string, logger *slog.Logger) error {
+func run(id, listen, advertise, peersFlag, dataDir string, snapEvery uint64, logger *slog.Logger) error {
 	peers, err := parsePeers(peersFlag)
 	if err != nil {
 		return err
@@ -54,19 +56,31 @@ func run(id, listen, advertise, peersFlag, dataDir string, logger *slog.Logger) 
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	store, err := kvs.OpenStore(filepath.Join(dataDir, "kvs.wal"))
+	// スナップショットがあればそこから復元し、以降の WAL レコードだけを再生する
+	snap, err := raft.LoadSnapshot(dataDir)
+	if err != nil {
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+	var snapIndex uint64
+	var snapData []byte
+	if snap != nil {
+		snapIndex, snapData = snap.Index, snap.Data
+	}
+	store, err := kvs.OpenStoreAt(filepath.Join(dataDir, "kvs.wal"), snapIndex, snapData)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer store.Close()
 
 	node, err := raft.NewNode(raft.Config{
-		ID:           id,
-		Addr:         advertise,
-		Peers:        peers,
-		DataDir:      dataDir,
-		AppliedIndex: store.AppliedIndex(),
-		Logger:       logger,
+		ID:                id,
+		Addr:              advertise,
+		Peers:             peers,
+		DataDir:           dataDir,
+		AppliedIndex:      store.AppliedIndex(),
+		Snapshotter:       store,
+		SnapshotThreshold: snapEvery,
+		Logger:            logger,
 		Apply: func(index uint64, command []byte) (any, error) {
 			cmd, err := kvs.DecodeCommand(command)
 			if err != nil {
@@ -137,6 +151,15 @@ func parsePeers(s string) (map[string]string, error) {
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envUint(key string, def uint64) uint64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
+		}
 	}
 	return def
 }

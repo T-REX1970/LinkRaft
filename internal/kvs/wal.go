@@ -69,6 +69,22 @@ func (w *WAL) Size() int64 {
 	return w.size
 }
 
+// Truncate は WAL を空にする。スナップショットが状態を代替した後に呼ぶ。
+func (w *WAL) Truncate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.w.Flush(); err != nil {
+		return fmt.Errorf("flush wal: %w", err)
+	}
+	if err := w.f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate wal: %w", err)
+	}
+	// O_APPEND で開いているため書き込み位置はサイズ 0 に追従する
+	w.w.Reset(w.f)
+	w.size = 0
+	return nil
+}
+
 // Close は WAL ファイルを閉じる。
 func (w *WAL) Close() error {
 	w.mu.Lock()

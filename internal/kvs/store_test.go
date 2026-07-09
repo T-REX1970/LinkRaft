@@ -93,6 +93,105 @@ func TestStoreWALPersistence(t *testing.T) {
 	}
 }
 
+func TestStoreSnapshotRestore(t *testing.T) {
+	s1 := NewStore(nil)
+	if _, err := s1.Apply(1, Command{Op: OpSet, Key: "a", Value: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Apply(2, Command{Op: OpIncr, Key: "seq"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := s1.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	s2 := NewStore(nil)
+	if err := s2.Restore(2, data); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if v, ok := s2.Get("a"); !ok || string(v) != "1" {
+		t.Fatalf("a = %q, %v", v, ok)
+	}
+	if n, err := s2.Incr("seq"); err != nil || n != 2 {
+		t.Fatalf("Incr after restore = %d, %v; want 2", n, err)
+	}
+	if s2.AppliedIndex() != 2 {
+		t.Fatalf("AppliedIndex = %d, want 2", s2.AppliedIndex())
+	}
+}
+
+func TestOpenStoreAtSkipsCoveredWALRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kvs.wal")
+
+	// スナップショット前の状態を WAL に書く
+	s1, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Apply(1, Command{Op: OpSet, Key: "k", Value: []byte("old")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Apply(2, Command{Op: OpSet, Key: "k", Value: []byte("snap")}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s1.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// WAL 切り詰め前にクラッシュした想定: index<=2 のレコードが残ったまま
+	if _, err := s1.Apply(3, Command{Op: OpSet, Key: "k2", Value: []byte("after")}); err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+
+	// スナップショット(index=2) + WAL 再生で復元
+	s2, err := OpenStoreAt(path, 2, snap)
+	if err != nil {
+		t.Fatalf("OpenStoreAt: %v", err)
+	}
+	defer s2.Close()
+	if v, _ := s2.Get("k"); string(v) != "snap" {
+		t.Fatalf("k = %q, want snap", v)
+	}
+	if v, ok := s2.Get("k2"); !ok || string(v) != "after" {
+		t.Fatalf("k2 = %q, %v; want after", v, ok)
+	}
+	if s2.AppliedIndex() != 3 {
+		t.Fatalf("AppliedIndex = %d, want 3", s2.AppliedIndex())
+	}
+}
+
+func TestStoreCompactedTruncatesWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kvs.wal")
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i := uint64(1); i <= 5; i++ {
+		if _, err := s.Apply(i, Command{Op: OpIncr, Key: "seq"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.WALSize() == 0 {
+		t.Fatal("WAL should not be empty before compaction")
+	}
+	if err := s.Compacted(5); err != nil {
+		t.Fatalf("Compacted: %v", err)
+	}
+	if s.WALSize() != 0 {
+		t.Fatalf("WALSize = %d, want 0", s.WALSize())
+	}
+	// 切り詰め後も書き込みできる
+	if _, err := s.Apply(6, Command{Op: OpSet, Key: "x", Value: []byte("y")}); err != nil {
+		t.Fatal(err)
+	}
+	if s.WALSize() == 0 {
+		t.Fatal("WAL should grow after new writes")
+	}
+}
+
 func TestStoreApplySkipsDuplicateIndex(t *testing.T) {
 	s := NewStore(nil)
 	if _, err := s.Apply(1, Command{Op: OpSet, Key: "k", Value: []byte("v1")}); err != nil {

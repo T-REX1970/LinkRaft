@@ -15,17 +15,22 @@ type Entry struct {
 }
 
 // Log は Raft ログ。メモリ上に全エントリを保持し、追記専用ファイルに永続化する。
-// スナップショットは未実装（学習用途）。ゴルーチン安全ではないので
-// 呼び出し側（Node）のロックで保護すること。
+// スナップショットで snapIndex 以前のエントリは破棄済み（ログコンパクション）。
+// ゴルーチン安全ではないので呼び出し側（Node）のロックで保護すること。
 type Log struct {
-	path    string
-	f       *os.File
-	entries []Entry // entries[0].Index == 1
+	path      string
+	f         *os.File
+	snapIndex uint64  // スナップショットに含まれる最後のインデックス（なければ 0）
+	snapTerm  uint64  // snapIndex のエントリの term
+	entries   []Entry // entries[0].Index == snapIndex+1
 }
 
 // OpenLog はログファイルを読み込んで Log を作る。
-func OpenLog(path string) (*Log, error) {
-	l := &Log{path: path}
+// snapIndex / snapTerm はスナップショットの境界（なければ 0, 0）。
+// スナップショット済みの古いエントリがファイルに残っていた場合は読み飛ばす
+// （スナップショット保存とログ切り詰めの間でクラッシュした場合に起きる）。
+func OpenLog(path string, snapIndex, snapTerm uint64) (*Log, error) {
+	l := &Log{path: path, snapIndex: snapIndex, snapTerm: snapTerm}
 	f, err := os.Open(path)
 	if err == nil {
 		sc := bufio.NewScanner(f)
@@ -38,6 +43,9 @@ func OpenLog(path string) (*Log, error) {
 			var e Entry
 			if err := json.Unmarshal(line, &e); err != nil {
 				break // 書き込み途中の末尾レコードは捨てる
+			}
+			if e.Index <= snapIndex {
+				continue // スナップショットで代替済み
 			}
 			l.entries = append(l.entries, e)
 		}
@@ -57,24 +65,34 @@ func OpenLog(path string) (*Log, error) {
 	return l, nil
 }
 
-// LastIndex は最後のエントリのインデックスを返す（空なら 0）。
+// SnapIndex はスナップショットに含まれる最後のインデックスを返す。
+func (l *Log) SnapIndex() uint64 { return l.snapIndex }
+
+// SnapTerm は SnapIndex のエントリの term を返す。
+func (l *Log) SnapTerm() uint64 { return l.snapTerm }
+
+// LastIndex は最後のエントリのインデックスを返す（ログが空ならスナップショット境界）。
 func (l *Log) LastIndex() uint64 {
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapIndex
 	}
 	return l.entries[len(l.entries)-1].Index
 }
 
-// LastTerm は最後のエントリの term を返す（空なら 0）。
+// LastTerm は最後のエントリの term を返す（ログが空ならスナップショットの term）。
 func (l *Log) LastTerm() uint64 {
 	if len(l.entries) == 0 {
-		return 0
+		return l.snapTerm
 	}
 	return l.entries[len(l.entries)-1].Term
 }
 
-// TermAt は index のエントリの term を返す。index==0 または範囲外なら 0。
+// TermAt は index のエントリの term を返す。
+// index がスナップショット境界ならスナップショットの term、範囲外なら 0。
 func (l *Log) TermAt(index uint64) uint64 {
+	if index == l.snapIndex {
+		return l.snapTerm
+	}
 	e, ok := l.At(index)
 	if !ok {
 		return 0
@@ -82,23 +100,25 @@ func (l *Log) TermAt(index uint64) uint64 {
 	return e.Term
 }
 
-// At は index のエントリを返す。
+// At は index のエントリを返す。スナップショット済みの範囲は取得できない。
 func (l *Log) At(index uint64) (Entry, bool) {
-	if index == 0 || index > l.LastIndex() {
+	if index <= l.snapIndex || index > l.LastIndex() {
 		return Entry{}, false
 	}
-	return l.entries[index-1], true
+	return l.entries[index-l.snapIndex-1], true
 }
 
 // From は index 以降のエントリのコピーを返す。
+// index がスナップショット済みの範囲を指す場合は保持している先頭から返すので、
+// 呼び出し側は SnapIndex を見て InstallSnapshot が必要か判断すること。
 func (l *Log) From(index uint64) []Entry {
-	if index == 0 {
-		index = 1
+	if index <= l.snapIndex {
+		index = l.snapIndex + 1
 	}
 	if index > l.LastIndex() {
 		return nil
 	}
-	src := l.entries[index-1:]
+	src := l.entries[index-l.snapIndex-1:]
 	out := make([]Entry, len(src))
 	copy(out, src)
 	return out
@@ -131,11 +151,36 @@ func (l *Log) Append(entries ...Entry) error {
 // TruncateFrom は index 以降のエントリを削除する（リーダーとの競合解消用）。
 // ファイルは全体を書き直す。競合は稀なので許容する。
 func (l *Log) TruncateFrom(index uint64) error {
-	if index == 0 || index > l.LastIndex() {
+	if index <= l.snapIndex {
+		index = l.snapIndex + 1 // スナップショット済みの範囲は削除できない
+	}
+	if index > l.LastIndex() {
 		return nil
 	}
-	l.entries = l.entries[:index-1]
+	l.entries = l.entries[:index-l.snapIndex-1]
+	return l.rewrite()
+}
 
+// CompactTo は index 以前のエントリを破棄してスナップショット境界を進める
+// （ログコンパクション）。term は index のエントリの term。
+func (l *Log) CompactTo(index, term uint64) error {
+	if index <= l.snapIndex {
+		return nil
+	}
+	if index >= l.LastIndex() {
+		l.entries = nil
+	} else {
+		// 前方を削るのでスライスを作り直して古い配列への参照を切る
+		rest := l.entries[index-l.snapIndex:]
+		l.entries = append([]Entry(nil), rest...)
+	}
+	l.snapIndex = index
+	l.snapTerm = term
+	return l.rewrite()
+}
+
+// rewrite は保持中のエントリでログファイルを書き直す。
+func (l *Log) rewrite() error {
 	if err := l.f.Close(); err != nil {
 		return fmt.Errorf("close raft log: %w", err)
 	}

@@ -54,8 +54,23 @@ func NewStore(wal *WAL) *Store {
 
 // OpenStore は WAL を開いて内容を再生し、永続化付きストアを返す。
 func OpenStore(walPath string) (*Store, error) {
-	s := &Store{data: make(map[string][]byte)}
+	return OpenStoreAt(walPath, 0, nil)
+}
+
+// OpenStoreAt はスナップショット（snapData, snapIndex まで適用済み）から状態を
+// 復元し、それより後の WAL レコードを再生して永続化付きストアを返す。
+// スナップショットがない場合は snapIndex=0, snapData=nil を渡す。
+func OpenStoreAt(walPath string, snapIndex uint64, snapData []byte) (*Store, error) {
+	s := &Store{data: make(map[string][]byte), appliedIndex: snapIndex}
+	if snapData != nil {
+		if err := json.Unmarshal(snapData, &s.data); err != nil {
+			return nil, fmt.Errorf("unmarshal snapshot data: %w", err)
+		}
+	}
 	err := ReplayWAL(walPath, func(index uint64, cmd Command) error {
+		if index != 0 && index <= snapIndex {
+			return nil // スナップショットでカバー済み（切り詰め前の残骸）
+		}
 		s.applyLocked(cmd)
 		if index > s.appliedIndex {
 			s.appliedIndex = index
@@ -183,6 +198,45 @@ func (s *Store) currentInt(key string) int64 {
 		return 0
 	}
 	return n
+}
+
+// ---- raft.Snapshotter の実装 ----
+
+// Snapshot は全キーの現在の状態をシリアライズして返す。
+func (s *Store) Snapshot() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.Marshal(s.data)
+}
+
+// Restore はスナップショットで状態を丸ごと置き換える。
+// 置き換え後の状態はスナップショットが担保するため WAL は空にする。
+func (s *Store) Restore(index uint64, data []byte) error {
+	m := make(map[string][]byte)
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("unmarshal snapshot data: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = m
+	s.appliedIndex = index
+	if s.wal != nil {
+		if err := s.wal.Truncate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Compacted は index までのスナップショットが永続化されたことの通知。
+// WAL の全レコードは index 以下なので空にできる。
+func (s *Store) Compacted(index uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wal == nil || index < s.appliedIndex {
+		return nil
+	}
+	return s.wal.Truncate()
 }
 
 // WALSize は WAL のサイズ（バイト）を返す。WAL なしの場合は 0。

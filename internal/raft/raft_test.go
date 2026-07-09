@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
@@ -14,6 +15,7 @@ import (
 )
 
 // testApplier はテスト用ステートマシン。適用されたコマンドを記録する。
+// Snapshotter も実装する（スナップショット = コマンド列全体のシリアライズ）。
 type testApplier struct {
 	mu   sync.Mutex
 	cmds [][]byte
@@ -36,6 +38,25 @@ func (a *testApplier) commands() [][]byte {
 	return out
 }
 
+func (a *testApplier) Snapshot() ([]byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return json.Marshal(a.cmds)
+}
+
+func (a *testApplier) Restore(_ uint64, data []byte) error {
+	var cmds [][]byte
+	if err := json.Unmarshal(data, &cmds); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cmds = cmds
+	return nil
+}
+
+func (a *testApplier) Compacted(uint64) error { return nil }
+
 type testNode struct {
 	node    *Node
 	applier *testApplier
@@ -44,7 +65,8 @@ type testNode struct {
 }
 
 // newTestCluster は localhost 上に size ノードの Raft クラスタを起動する。
-func newTestCluster(t *testing.T, size int) []*testNode {
+// snapThreshold > 0 ならスナップショット（ログコンパクション）を有効にする。
+func newTestCluster(t *testing.T, size int, snapThreshold uint64) []*testNode {
 	t.Helper()
 
 	listeners := make([]net.Listener, size)
@@ -68,7 +90,7 @@ func newTestCluster(t *testing.T, size int) []*testNode {
 			}
 		}
 		applier := &testApplier{}
-		node, err := NewNode(Config{
+		cfg := Config{
 			ID:      id,
 			Addr:    addrs[i],
 			Peers:   peers,
@@ -78,7 +100,12 @@ func newTestCluster(t *testing.T, size int) []*testNode {
 			ElectionTimeoutMax: 300 * time.Millisecond,
 			HeartbeatInterval:  30 * time.Millisecond,
 			Apply:              applier.apply,
-		})
+		}
+		if snapThreshold > 0 {
+			cfg.Snapshotter = applier
+			cfg.SnapshotThreshold = snapThreshold
+		}
+		node, err := NewNode(cfg)
 		if err != nil {
 			t.Fatalf("NewNode: %v", err)
 		}
@@ -122,7 +149,7 @@ func waitForLeader(t *testing.T, nodes []*testNode, alive map[int]bool) int {
 }
 
 func TestLeaderElection(t *testing.T) {
-	nodes := newTestCluster(t, 3)
+	nodes := newTestCluster(t, 3, 0)
 	leader := waitForLeader(t, nodes, nil)
 	st := nodes[leader].node.GetStatus()
 	if st.Term == 0 {
@@ -146,7 +173,7 @@ func TestLeaderElection(t *testing.T) {
 }
 
 func TestLogReplication(t *testing.T) {
-	nodes := newTestCluster(t, 3)
+	nodes := newTestCluster(t, 3, 0)
 	leader := waitForLeader(t, nodes, nil)
 
 	want := [][]byte{}
@@ -192,7 +219,7 @@ func TestLogReplication(t *testing.T) {
 }
 
 func TestProposeOnFollowerReturnsNotLeader(t *testing.T) {
-	nodes := newTestCluster(t, 3)
+	nodes := newTestCluster(t, 3, 0)
 	leader := waitForLeader(t, nodes, nil)
 
 	follower := (leader + 1) % len(nodes)
@@ -219,7 +246,7 @@ func TestProposeOnFollowerReturnsNotLeader(t *testing.T) {
 }
 
 func TestLeaderFailover(t *testing.T) {
-	nodes := newTestCluster(t, 3)
+	nodes := newTestCluster(t, 3, 0)
 	leader := waitForLeader(t, nodes, nil)
 
 	// コミット済みデータを作っておく
@@ -249,4 +276,103 @@ func TestLeaderFailover(t *testing.T) {
 	if _, err := nodes[newLeader].node.Propose(ctx2, []byte("after-failover")); err != nil {
 		t.Fatalf("Propose after failover: %v", err)
 	}
+}
+
+// TestSnapshotCatchUp は、リーダーがログをコンパクションした後に復帰した
+// フォロワーが InstallSnapshot 経由で追いつけることを検証する。
+func TestSnapshotCatchUp(t *testing.T) {
+	nodes := newTestCluster(t, 3, 5) // 5 エントリごとにスナップショット
+	leader := waitForLeader(t, nodes, nil)
+
+	// フォロワーを 1 台切り離す（プロセスは生きているが RPC が届かない）。
+	// pre-vote 未実装のため、切断中に選挙を起こしてリーダーを乱さないよう
+	// 選挙タイマーを事実上止めておく。
+	follower := (leader + 1) % len(nodes)
+	fn := nodes[follower].node
+	fn.mu.Lock()
+	fn.electionTimeoutMin = time.Hour
+	fn.electionTimeoutMax = 2 * time.Hour
+	fn.electionTimeout = time.Hour
+	fn.mu.Unlock()
+	nodes[follower].server.Stop()
+
+	// スナップショットのしきい値を大きく超える数を書き込む
+	want := [][]byte{}
+	for i := 0; i < 20; i++ {
+		cmd := []byte(fmt.Sprintf("cmd-%d", i))
+		want = append(want, cmd)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err := nodes[leader].node.Propose(ctx, cmd)
+		cancel()
+		if err != nil {
+			t.Fatalf("Propose(%d): %v", i, err)
+		}
+	}
+
+	// リーダーがログをコンパクションするまで待つ
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if nodes[leader].node.GetStatus().SnapshotIndex > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	leaderSt := nodes[leader].node.GetStatus()
+	if leaderSt.SnapshotIndex == 0 {
+		t.Fatal("leader did not take a snapshot")
+	}
+
+	// フォロワーを復帰させる（同じアドレスで gRPC サーバーを立て直す）
+	ln, err := net.Listen("tcp", nodes[follower].addr)
+	if err != nil {
+		t.Fatalf("relisten: %v", err)
+	}
+	srv := grpc.NewServer()
+	raftpb.RegisterRaftServer(srv, NewServer(nodes[follower].node))
+	go srv.Serve(ln)
+	t.Cleanup(srv.Stop)
+
+	// スナップショット + 差分ログで追いつくまで待つ
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st := nodes[follower].node.GetStatus()
+		if st.AppliedIndex >= leaderSt.AppliedIndex && st.SnapshotIndex > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	st := nodes[follower].node.GetStatus()
+	if st.SnapshotIndex == 0 {
+		t.Fatalf("follower did not install a snapshot: %+v", st)
+	}
+	if st.AppliedIndex < leaderSt.AppliedIndex {
+		t.Fatalf("follower applied=%d, want >= %d", st.AppliedIndex, leaderSt.AppliedIndex)
+	}
+
+	// ステートマシンの内容がリーダーと一致する
+	got := nodes[follower].applier.commands()
+	if len(got) != len(want) {
+		t.Fatalf("follower has %d commands, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if string(got[i]) != string(want[i]) {
+			t.Fatalf("cmd %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// 復帰後は通常のログ複製に戻る
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := nodes[leader].node.Propose(ctx, []byte("after-catchup")); err != nil {
+		t.Fatalf("Propose after catch-up: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cmds := nodes[follower].applier.commands()
+		if len(cmds) == len(want)+1 && string(cmds[len(cmds)-1]) == "after-catchup" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("follower did not receive entries after catch-up")
 }

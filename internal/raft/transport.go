@@ -15,6 +15,7 @@ import (
 type Transport interface {
 	RequestVote(ctx context.Context, peerID string, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, peerID string, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error)
+	InstallSnapshot(ctx context.Context, peerID string, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error)
 	Close() error
 }
 
@@ -71,6 +72,15 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, peerID string, req *r
 	return c.AppendEntries(ctx, req)
 }
 
+// InstallSnapshot はスナップショット転送 RPC を送る。
+func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peerID string, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	c, err := t.client(peerID)
+	if err != nil {
+		return nil, err
+	}
+	return c.InstallSnapshot(ctx, req)
+}
+
 // Close は全ピアへの接続を閉じる。
 func (t *GRPCTransport) Close() error {
 	t.mu.Lock()
@@ -104,4 +114,9 @@ func (s *Server) RequestVote(_ context.Context, req *raftpb.RequestVoteRequest) 
 // AppendEntries はログ複製 / ハートビートを処理する。
 func (s *Server) AppendEntries(_ context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
 	return s.node.handleAppendEntries(req), nil
+}
+
+// InstallSnapshot はスナップショット転送を処理する。
+func (s *Server) InstallSnapshot(_ context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return s.node.handleInstallSnapshot(req), nil
 }
