@@ -2,6 +2,10 @@
 package api
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
 
@@ -10,12 +14,26 @@ import (
 )
 
 // NewRouter はハンドラーを配線した Echo インスタンスを返す。
-func NewRouter(h *handler.Handler, jwtSecret []byte) *echo.Echo {
+// webDir にフロントエンドのビルド成果物 (web/dist) があれば静的配信する。
+func NewRouter(h *handler.Handler, jwtSecret []byte, webDir string) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(echomw.Recover())
 	e.Use(echomw.Logger())
 	e.Use(echomw.CORS()) // 開発時の Vite dev server (別ポート) からのアクセス用
+
+	// SPA なので存在しないパスは index.html にフォールバックする（HTML5: true）。
+	if webDir != "" {
+		if _, err := os.Stat(filepath.Join(webDir, "index.html")); err == nil {
+			e.Use(echomw.StaticWithConfig(echomw.StaticConfig{
+				Root:  webDir,
+				HTML5: true,
+				Skipper: func(c echo.Context) bool {
+					return strings.HasPrefix(c.Request().URL.Path, "/api")
+				},
+			}))
+		}
+	}
 
 	pub := e.Group("/api")
 	pub.POST("/auth/signup", h.Signup)

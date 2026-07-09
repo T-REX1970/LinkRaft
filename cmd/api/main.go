@@ -28,6 +28,7 @@ func main() {
 		addr     = flag.String("addr", envOr("API_ADDR", ":8080"), "HTTP リッスンアドレス")
 		kvsAddrs = flag.String("kvs", envOr("KVS_ADDRS", "localhost:9000,localhost:9001,localhost:9002"), "KVS ノードアドレス（カンマ区切り）")
 		secret   = flag.String("jwt-secret", os.Getenv("JWT_SECRET"), "JWT 署名シークレット")
+		webDir   = flag.String("web", envOr("WEB_DIR", "./web/dist"), "フロントエンドのビルド成果物ディレクトリ（なければ API のみ）")
 	)
 	flag.Parse()
 
@@ -52,7 +53,7 @@ func main() {
 	defer client.Close()
 
 	h := handler.New(client, []byte(*secret))
-	e := api.NewRouter(h, []byte(*secret))
+	e := api.NewRouter(h, []byte(*secret), *webDir)
 
 	go func() {
 		if err := e.Start(*addr); err != nil && !errors.Is(err, http.ErrServerClosed) {

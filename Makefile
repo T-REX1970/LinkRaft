@@ -4,7 +4,7 @@ GO      ?= go
 PROTOC  ?= protoc
 BIN_DIR := bin
 
-.PHONY: all build test lint vet proto clean run-kvs-0 run-kvs-1 run-kvs-2 run-api
+.PHONY: all build web web-dev test lint vet proto clean run-kvs-0 run-kvs-1 run-kvs-2 run-api
 
 all: build
 
@@ -12,6 +12,14 @@ all: build
 build:
 	$(GO) build -o $(BIN_DIR)/api ./cmd/api
 	$(GO) build -o $(BIN_DIR)/kvs ./cmd/kvs
+
+## web: フロントエンドを web/dist にビルド（API サーバーが配信する）
+web:
+	cd web && npm install && npm run build
+
+## web-dev: Vite dev server を起動（:5173、/api は :8080 にプロキシ）
+web-dev:
+	cd web && npm install && npm run dev
 
 ## test: 全パッケージのテスト（race detector 付き）
 test:

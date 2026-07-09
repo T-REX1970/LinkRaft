@@ -44,7 +44,7 @@ var testSecret = []byte("test-secret")
 func newTestServer(t *testing.T) *echo.Echo {
 	t.Helper()
 	h := handler.New(fakeKV{s: kvs.NewStore(nil)}, testSecret)
-	return api.NewRouter(h, testSecret)
+	return api.NewRouter(h, testSecret, "")
 }
 
 func doJSON(e *echo.Echo, method, path, body, token string) *httptest.ResponseRecorder {
