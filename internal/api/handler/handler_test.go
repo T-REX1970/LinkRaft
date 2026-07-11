@@ -36,8 +36,13 @@ func (f fakeKV) Keys(_ context.Context, prefix string) ([]string, error) {
 	return f.s.Keys(prefix), nil
 }
 func (f fakeKV) ClusterStatus(_ context.Context) []kvs.NodeStatus {
-	return []kvs.NodeStatus{{NodeID: "node-0", Address: "fake:9000", State: "leader", LeaderID: "node-0"}}
+	return []kvs.NodeStatus{{
+		NodeID: "node-0", Address: "fake:9000", State: "leader", LeaderID: "node-0",
+		Members: []kvs.MemberStatus{{ID: "node-0", Addr: "fake:9000", MatchIndex: 1}},
+	}}
 }
+func (f fakeKV) AddMember(_ context.Context, id, addr string) error { return nil }
+func (f fakeKV) RemoveMember(_ context.Context, id string) error    { return nil }
 
 var testSecret = []byte("test-secret")
 

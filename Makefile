@@ -4,7 +4,7 @@ GO      ?= go
 PROTOC  ?= protoc
 BIN_DIR := bin
 
-.PHONY: all build web web-dev test lint vet proto clean run-kvs-0 run-kvs-1 run-kvs-2 run-api
+.PHONY: all build web web-dev test lint vet proto clean run-kvs-0 run-kvs-1 run-kvs-2 run-kvs-3-join run-api
 
 all: build
 
@@ -52,6 +52,12 @@ run-kvs-1: build
 run-kvs-2: build
 	$(BIN_DIR)/kvs -id node-2 -listen :9002 -advertise localhost:9002 \
 		-peers node-0=localhost:9000,node-1=localhost:9001 -data ./data/node-2
+
+## run-kvs-3-join: 4 台目を join モードで起動（Web UI かクラスタ API で AddMember すると参加する）
+run-kvs-3-join: build
+	$(BIN_DIR)/kvs -id node-3 -listen :9003 -advertise localhost:9003 \
+		-peers node-0=localhost:9000,node-1=localhost:9001,node-2=localhost:9002 \
+		-data ./data/node-3 -join
 
 ## run-api: API サーバーを起動（KVS クラスタ起動後に実行）
 run-api: build

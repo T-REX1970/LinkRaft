@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/noda/linkraft/internal/raft"
 	"github.com/noda/linkraft/proto/kvspb"
 )
 
@@ -50,7 +50,7 @@ func (c *Client) clientFor(addr string) (kvspb.KVSClient, error) {
 	if conn, ok := c.conns[addr]; ok {
 		return kvspb.NewKVSClient(conn), nil
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, raft.DialOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("dial kvs node %s: %w", addr, err)
 	}
@@ -207,24 +207,108 @@ func (c *Client) Keys(ctx context.Context, prefix string) ([]string, error) {
 	return keys, err
 }
 
+// AddMember はノードをクラスタに追加する（リーダーに転送される）。
+// 追加するノードは先に -join モードで起動しておくこと。
+func (c *Client) AddMember(ctx context.Context, id, addr string) error {
+	return c.memberChange(ctx, func(cli kvspb.KVSClient) (*kvspb.MemberChangeResponse, error) {
+		return cli.AddMember(ctx, &kvspb.AddMemberRequest{Id: id, Addr: addr})
+	})
+}
+
+// RemoveMember はノードをクラスタから削除する（リーダーに転送される）。
+func (c *Client) RemoveMember(ctx context.Context, id string) error {
+	return c.memberChange(ctx, func(cli kvspb.KVSClient) (*kvspb.MemberChangeResponse, error) {
+		return cli.RemoveMember(ctx, &kvspb.RemoveMemberRequest{Id: id})
+	})
+}
+
+func (c *Client) memberChange(ctx context.Context, fn func(cli kvspb.KVSClient) (*kvspb.MemberChangeResponse, error)) error {
+	var opErr error
+	err := c.call(ctx, func(cli kvspb.KVSClient) (bool, string, error) {
+		resp, err := fn(cli)
+		if err != nil {
+			return false, "", err
+		}
+		if resp.NotLeader {
+			return true, resp.LeaderAddr, nil
+		}
+		if resp.Error != "" {
+			opErr = errors.New(resp.Error)
+		}
+		return false, "", nil
+	})
+	if err != nil {
+		return err
+	}
+	return opErr
+}
+
+// MemberStatus はノードが認識しているクラスタメンバー 1 台分の情報。
+type MemberStatus struct {
+	ID         string `json:"id"`
+	Addr       string `json:"addr"`
+	MatchIndex uint64 `json:"match_index"` // リーダー応答時のみ有効
+}
+
 // NodeStatus は 1 ノードの状態。
 type NodeStatus struct {
-	Address      string `json:"address"`
-	NodeID       string `json:"id"`
-	State        string `json:"state"` // leader / follower / candidate / down
-	Term         uint64 `json:"term"`
-	LeaderID     string `json:"leader_id"`
-	CommitIndex  uint64 `json:"commit_index"`
-	AppliedIndex uint64 `json:"applied_index"`
-	KeysTotal    int64  `json:"keys_total"`
+	Address       string         `json:"address"`
+	NodeID        string         `json:"id"`
+	State         string         `json:"state"` // leader / follower / candidate / down
+	Term          uint64         `json:"term"`
+	LeaderID      string         `json:"leader_id"`
+	CommitIndex   uint64         `json:"commit_index"`
+	AppliedIndex  uint64         `json:"applied_index"`
+	LastLogIndex  uint64         `json:"last_log_index"`
+	SnapshotIndex uint64         `json:"snapshot_index"`
+	KeysTotal     int64          `json:"keys_total"`
+	Members       []MemberStatus `json:"members,omitempty"`
+}
+
+func (c *Client) statusOf(ctx context.Context, addr string) NodeStatus {
+	st := NodeStatus{Address: addr, State: "down"}
+	cli, err := c.clientFor(addr)
+	if err != nil {
+		return st
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	resp, err := cli.Status(cctx, &kvspb.StatusRequest{})
+	if err != nil {
+		return st
+	}
+	members := make([]MemberStatus, 0, len(resp.Members))
+	for _, m := range resp.Members {
+		members = append(members, MemberStatus{ID: m.Id, Addr: m.Addr, MatchIndex: m.MatchIndex})
+	}
+	return NodeStatus{
+		Address:       addr,
+		NodeID:        resp.NodeId,
+		State:         resp.State,
+		Term:          resp.Term,
+		LeaderID:      resp.LeaderId,
+		CommitIndex:   resp.CommitIndex,
+		AppliedIndex:  resp.AppliedIndex,
+		LastLogIndex:  resp.LastLogIndex,
+		SnapshotIndex: resp.SnapshotIndex,
+		KeysTotal:     resp.KeysTotal,
+		Members:       members,
+	}
 }
 
 // ClusterStatus は全ノードに Status を問い合わせる。落ちているノードは state="down"。
+// 応答に含まれるメンバー情報から、起動時に知らなかったノード（動的に追加された
+// ノード）も発見して問い合わせ、以降の書き込みのフェイルオーバー先にも加える。
 func (c *Client) ClusterStatus(ctx context.Context) []NodeStatus {
 	c.mu.Lock()
 	addrs := make([]string, len(c.addrs))
 	copy(addrs, c.addrs)
 	c.mu.Unlock()
+
+	queried := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		queried[a] = true
+	}
 
 	out := make([]NodeStatus, len(addrs))
 	var wg sync.WaitGroup
@@ -232,29 +316,44 @@ func (c *Client) ClusterStatus(ctx context.Context) []NodeStatus {
 		wg.Add(1)
 		go func(i int, addr string) {
 			defer wg.Done()
-			out[i] = NodeStatus{Address: addr, State: "down"}
-			cli, err := c.clientFor(addr)
-			if err != nil {
-				return
-			}
-			cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			defer cancel()
-			resp, err := cli.Status(cctx, &kvspb.StatusRequest{})
-			if err != nil {
-				return
-			}
-			out[i] = NodeStatus{
-				Address:      addr,
-				NodeID:       resp.NodeId,
-				State:        resp.State,
-				Term:         resp.Term,
-				LeaderID:     resp.LeaderId,
-				CommitIndex:  resp.CommitIndex,
-				AppliedIndex: resp.AppliedIndex,
-				KeysTotal:    resp.KeysTotal,
-			}
+			out[i] = c.statusOf(ctx, addr)
 		}(i, addr)
 	}
 	wg.Wait()
+
+	// 応答から新メンバーのアドレスを発見して 1 段だけ追加照会する
+	extra := []string{}
+	for _, st := range out {
+		for _, m := range st.Members {
+			if m.Addr != "" && !queried[m.Addr] {
+				queried[m.Addr] = true
+				extra = append(extra, m.Addr)
+			}
+		}
+	}
+	if len(extra) > 0 {
+		more := make([]NodeStatus, len(extra))
+		for i, addr := range extra {
+			wg.Add(1)
+			go func(i int, addr string) {
+				defer wg.Done()
+				more[i] = c.statusOf(ctx, addr)
+			}(i, addr)
+		}
+		wg.Wait()
+		out = append(out, more...)
+
+		c.mu.Lock()
+		known := make(map[string]bool, len(c.addrs))
+		for _, a := range c.addrs {
+			known[a] = true
+		}
+		for _, a := range extra {
+			if !known[a] {
+				c.addrs = append(c.addrs, a)
+			}
+		}
+		c.mu.Unlock()
+	}
 	return out
 }

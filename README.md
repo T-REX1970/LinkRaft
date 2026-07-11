@@ -21,11 +21,16 @@ web/        # フロントエンド SPA（Vite + React + TypeScript）
 ```
 
 - 書き込み（Set / Delete / Incr）はリーダーで Raft 合意を取ってから適用
+- 読み取り（Get / Keys）は ReadIndex（過半数への生存確認 + 適用待ち）を通すので線形化可能
 - フォロワーに書き込むとリーダーのアドレスヒントが返り、API 側クライアントが自動で追従
 - 各ノードは WAL と Raft ログをディスクに永続化し、再起動時に復元・キャッチアップする
 - 一定数のエントリ適用ごとにスナップショットを取り、Raft ログと WAL を切り詰める
   （`-snapshot-threshold`、デフォルト 1000）。大きく遅れたノードには
   InstallSnapshot RPC でスナップショットごと転送して追いつかせる
+- pre-vote（事前投票）により、切断から復帰したノードや除去済みノードが
+  無駄に term を上げてリーダーを乱すことがない
+- メンバーシップ変更（単一サーバー方式）: 稼働中のクラスタにノードを
+  追加・削除できる（下記「メンバーシップ変更デモ」参照）
 
 ## 起動方法（ローカル）
 
@@ -83,6 +88,27 @@ curl -s 'localhost:8080/api/links?sort=popular'
 curl -s localhost:8080/api/health   # リーダーを確認して kill してみる
 ```
 
+### メンバーシップ変更デモ
+
+稼働中のクラスタに 4 台目を追加する。追加するノードは `-join` フラグ付きで
+起動しておく（リーダーから構成に加えられるまで選挙を起こさない）。
+
+```sh
+make run-kvs-3-join   # ターミナル 5: node-3 を join モードで起動
+
+# Web UI のクラスタ状態ページから追加するか、API で:
+curl -s -X POST localhost:8080/api/cluster/members \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"id":"node-3","addr":"localhost:9003"}'
+
+# 削除（リーダー以外を指定する）
+curl -s -X DELETE localhost:8080/api/cluster/members/node-1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+クラスタ状態ページ（/health）ではノードごとの複製進捗と構成が
+リアルタイムで見えるので、追加ノードが追いつく様子を観察できる。
+
 ## 開発
 
 ```sh
@@ -109,4 +135,7 @@ make proto   # .proto から Go コードを再生成（protoc が必要）
 | DELETE | /api/comments/:id | 要 | コメント削除（本人のみ） |
 | GET | /api/users/:id | - | プロフィール |
 | POST | /api/ogp | - | OGP 情報取得 |
-| GET | /api/health | - | クラスタ状態 |
+| GET | /api/tags | - | 使用中タグ一覧（サジェスト用） |
+| GET | /api/health | - | クラスタ状態（複製進捗・構成含む） |
+| POST | /api/cluster/members | 要 | ノード追加（メンバーシップ変更） |
+| DELETE | /api/cluster/members/:id | 要 | ノード削除（メンバーシップ変更） |

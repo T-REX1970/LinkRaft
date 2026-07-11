@@ -7,11 +7,18 @@ import (
 	"os"
 )
 
+// エントリの種別。
+const (
+	EntryNormal uint32 = 0 // 通常のコマンド / no-op
+	EntryConfig uint32 = 1 // メンバーシップ変更（Command は全メンバーの id -> addr の JSON）
+)
+
 // Entry は Raft ログの 1 エントリ。Index は 1 始まり。
 type Entry struct {
 	Term    uint64 `json:"t"`
 	Index   uint64 `json:"i"`
 	Command []byte `json:"c,omitempty"`
+	Type    uint32 `json:"y,omitempty"`
 }
 
 // Log は Raft ログ。メモリ上に全エントリを保持し、追記専用ファイルに永続化する。
@@ -122,6 +129,16 @@ func (l *Log) From(index uint64) []Entry {
 	out := make([]Entry, len(src))
 	copy(out, src)
 	return out
+}
+
+// LatestConfig は保持しているエントリのうち最後の設定変更エントリを返す。
+func (l *Log) LatestConfig() (Entry, bool) {
+	for i := len(l.entries) - 1; i >= 0; i-- {
+		if l.entries[i].Type == EntryConfig {
+			return l.entries[i], true
+		}
+	}
+	return Entry{}, false
 }
 
 // Append はエントリを追記して永続化する。

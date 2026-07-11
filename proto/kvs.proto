@@ -14,6 +14,9 @@ service KVS {
   rpc Incr(IncrRequest) returns (IncrResponse);
   rpc Keys(KeysRequest) returns (KeysResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // メンバーシップ変更（リーダーのみ受け付け。フォロワーはヒントを返す）
+  rpc AddMember(AddMemberRequest) returns (MemberChangeResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (MemberChangeResponse);
 }
 
 message GetRequest {
@@ -77,4 +80,36 @@ message StatusResponse {
   uint64 commit_index = 5;
   uint64 applied_index = 6;
   int64 keys_total = 7;
+  // ログコンパクション済みの境界（なければ 0）
+  uint64 snapshot_index = 8;
+  // このノードが認識しているクラスタ構成（自分を含む）
+  repeated Member members = 9;
+  // ログ末尾のインデックス（複製進捗の分母に使う）
+  uint64 last_log_index = 10;
+}
+
+// Member はクラスタメンバー 1 台分の情報。
+message Member {
+  string id = 1;
+  string addr = 2;
+  // リーダーが把握している複製済みインデックス（リーダー応答時のみ意味を持つ。
+  // 自ノード分はログ末尾）
+  uint64 match_index = 3;
+}
+
+message AddMemberRequest {
+  string id = 1;
+  string addr = 2;
+}
+
+message RemoveMemberRequest {
+  string id = 1;
+}
+
+message MemberChangeResponse {
+  bool not_leader = 1;
+  string leader_addr = 2;
+  // 変更を受け付けられなかった理由（変更が進行中、リーダー自身の削除など）。
+  // 空なら成功。
+  string error = 3;
 }

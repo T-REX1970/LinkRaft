@@ -9,8 +9,8 @@ import (
 )
 
 // Server は kvspb.KVSServer の実装。書き込みは Raft 経由で合意してから
-// ステートマシン（Store）に適用する。読み取りはリーダーのみ受け付ける
-// （リーダーリースは未実装のため厳密な線形化可能性はないが、学習用途として許容）。
+// ステートマシン（Store）に適用する。読み取りはリーダーのみ受け付け、
+// ReadIndex（過半数への生存確認 + 適用待ち）を挟むことで線形化可能性を保証する。
 type Server struct {
 	kvspb.UnimplementedKVSServer
 	store *Store
@@ -40,18 +40,26 @@ func (s *Server) propose(ctx context.Context, cmd Command) (res any, notLeader b
 	return res, false, "", nil
 }
 
-// notLeaderHint はリーダーでない場合に (true, リーダーアドレス) を返す。
-func (s *Server) notLeaderHint() (bool, string) {
-	st := s.node.GetStatus()
-	if st.State == raft.Leader {
-		return false, ""
+// readIndex は線形化可能な読み取りの前処理。リーダーでない（または
+// リーダーの座を失っていた）場合は notLeader = true とヒントを返す。
+func (s *Server) readIndex(ctx context.Context) (notLeader bool, hint string, err error) {
+	if err := s.node.ReadIndex(ctx); err != nil {
+		var nl *raft.NotLeaderError
+		if errors.As(err, &nl) {
+			return true, nl.LeaderAddr, nil
+		}
+		return false, "", err
 	}
-	return true, st.LeaderAddr
+	return false, "", nil
 }
 
 // Get はキーの値を返す。
-func (s *Server) Get(_ context.Context, req *kvspb.GetRequest) (*kvspb.GetResponse, error) {
-	if notLeader, hint := s.notLeaderHint(); notLeader {
+func (s *Server) Get(ctx context.Context, req *kvspb.GetRequest) (*kvspb.GetResponse, error) {
+	notLeader, hint, err := s.readIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if notLeader {
 		return &kvspb.GetResponse{NotLeader: true, LeaderAddr: hint}, nil
 	}
 	v, ok := s.store.Get(req.Key)
@@ -99,8 +107,12 @@ func (s *Server) Incr(ctx context.Context, req *kvspb.IncrRequest) (*kvspb.IncrR
 }
 
 // Keys は prefix にマッチするキー一覧を返す。
-func (s *Server) Keys(_ context.Context, req *kvspb.KeysRequest) (*kvspb.KeysResponse, error) {
-	if notLeader, hint := s.notLeaderHint(); notLeader {
+func (s *Server) Keys(ctx context.Context, req *kvspb.KeysRequest) (*kvspb.KeysResponse, error) {
+	notLeader, hint, err := s.readIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if notLeader {
 		return &kvspb.KeysResponse{NotLeader: true, LeaderAddr: hint}, nil
 	}
 	return &kvspb.KeysResponse{Keys: s.store.Keys(req.Prefix)}, nil
@@ -109,13 +121,45 @@ func (s *Server) Keys(_ context.Context, req *kvspb.KeysRequest) (*kvspb.KeysRes
 // Status はノードの状態を返す（どのノードでも応答する）。
 func (s *Server) Status(_ context.Context, _ *kvspb.StatusRequest) (*kvspb.StatusResponse, error) {
 	st := s.node.GetStatus()
+	members := make([]*kvspb.Member, 0, len(st.Members))
+	for _, m := range st.Members {
+		members = append(members, &kvspb.Member{Id: m.ID, Addr: m.Addr, MatchIndex: m.MatchIndex})
+	}
 	return &kvspb.StatusResponse{
-		NodeId:       st.ID,
-		State:        st.State.String(),
-		Term:         st.Term,
-		LeaderId:     st.LeaderID,
-		CommitIndex:  st.CommitIndex,
-		AppliedIndex: st.AppliedIndex,
-		KeysTotal:    int64(s.store.Len()),
+		NodeId:        st.ID,
+		State:         st.State.String(),
+		Term:          st.Term,
+		LeaderId:      st.LeaderID,
+		CommitIndex:   st.CommitIndex,
+		AppliedIndex:  st.AppliedIndex,
+		SnapshotIndex: st.SnapshotIndex,
+		LastLogIndex:  st.LastLogIndex,
+		KeysTotal:     int64(s.store.Len()),
+		Members:       members,
 	}, nil
+}
+
+// memberChangeResponse は raft のメンバーシップ変更結果を RPC 応答に変換する。
+func memberChangeResponse(err error) (*kvspb.MemberChangeResponse, error) {
+	if err == nil {
+		return &kvspb.MemberChangeResponse{}, nil
+	}
+	var nl *raft.NotLeaderError
+	if errors.As(err, &nl) {
+		return &kvspb.MemberChangeResponse{NotLeader: true, LeaderAddr: nl.LeaderAddr}, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	return &kvspb.MemberChangeResponse{Error: err.Error()}, nil
+}
+
+// AddMember はノードをクラスタに追加する。
+func (s *Server) AddMember(ctx context.Context, req *kvspb.AddMemberRequest) (*kvspb.MemberChangeResponse, error) {
+	return memberChangeResponse(s.node.AddMember(ctx, req.Id, req.Addr))
+}
+
+// RemoveMember はノードをクラスタから削除する。
+func (s *Server) RemoveMember(ctx context.Context, req *kvspb.RemoveMemberRequest) (*kvspb.MemberChangeResponse, error) {
+	return memberChangeResponse(s.node.RemoveMember(ctx, req.Id))
 }

@@ -13,6 +13,9 @@ type Snapshot struct {
 	Index uint64 `json:"index"` // このスナップショットに含まれる最後のログインデックス
 	Term  uint64 `json:"term"`  // Index のエントリの term
 	Data  []byte `json:"data"`
+	// スナップショット時点のクラスタ構成（自分を含む id -> addr）。
+	// 空なら構成情報なし（旧形式のスナップショット）。
+	Members map[string]string `json:"members,omitempty"`
 }
 
 // Snapshotter はスナップショット対応のステートマシンが実装する。

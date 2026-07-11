@@ -61,9 +61,31 @@ export interface HealthNode {
   address: string;
   state: "leader" | "follower" | "candidate" | "down";
   is_leader: boolean;
+  is_member: boolean; // リーダーが認識する現構成に含まれるか
+  term: number;
+  commit_index: number;
+  applied_index: number;
+  last_log_index: number;
+  snapshot_index: number;
+  keys_total: number;
+  match_index: number; // リーダーが把握している複製済みインデックス
+}
+
+export interface HealthMember {
+  id: string;
+  addr: string;
+  match_index: number;
 }
 
 export interface HealthResponse {
   nodes: HealthNode[];
   leader_id: string;
+  term: number;
+  last_log_index: number;
+  members: HealthMember[] | null;
+}
+
+export interface Tag {
+  name: string;
+  count: number;
 }

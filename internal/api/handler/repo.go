@@ -19,6 +19,8 @@ type KV interface {
 	Incr(ctx context.Context, key string) (int64, error)
 	Keys(ctx context.Context, prefix string) ([]string, error)
 	ClusterStatus(ctx context.Context) []kvs.NodeStatus
+	AddMember(ctx context.Context, id, addr string) error
+	RemoveMember(ctx context.Context, id string) error
 }
 
 // ---- KVS キー構造（claude.md データ設計に対応）----

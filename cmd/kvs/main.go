@@ -37,17 +37,18 @@ func main() {
 		peersFlag = flag.String("peers", envOr("KVS_PEERS", ""), "他ノード一覧 (id=addr,id=addr)")
 		dataDir   = flag.String("data", envOr("KVS_DATA_DIR", "./data"), "WAL / Raft ログの保存先")
 		snapEvery = flag.Uint64("snapshot-threshold", envUint("KVS_SNAPSHOT_THRESHOLD", 1000), "この数のエントリを適用するごとにスナップショットを取る")
+		join      = flag.Bool("join", envOr("KVS_JOIN", "") == "true", "既存クラスタへの参加モード（リーダーの AddMember で構成に加わるまで選挙を起こさない）")
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(*id, *listen, *advertise, *peersFlag, *dataDir, *snapEvery, logger); err != nil {
+	if err := run(*id, *listen, *advertise, *peersFlag, *dataDir, *snapEvery, *join, logger); err != nil {
 		logger.Error("kvs node exited with error", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(id, listen, advertise, peersFlag, dataDir string, snapEvery uint64, logger *slog.Logger) error {
+func run(id, listen, advertise, peersFlag, dataDir string, snapEvery uint64, join bool, logger *slog.Logger) error {
 	peers, err := parsePeers(peersFlag)
 	if err != nil {
 		return err
@@ -76,6 +77,7 @@ func run(id, listen, advertise, peersFlag, dataDir string, snapEvery uint64, log
 		ID:                id,
 		Addr:              advertise,
 		Peers:             peers,
+		Join:              join,
 		DataDir:           dataDir,
 		AppliedIndex:      store.AppliedIndex(),
 		Snapshotter:       store,

@@ -1,6 +1,7 @@
 // Package raft は Raft 合意アルゴリズムの学習用実装。
-// リーダー選出・ログ複製・スナップショット（ログコンパクション）を実装する。
-// メンバーシップ変更は未対応。
+// リーダー選出・ログ複製・スナップショット（ログコンパクション）に加え、
+// pre-vote（事前投票）、ReadIndex による線形化可能な読み取り、
+// 単一サーバー方式のメンバーシップ変更（ノードの動的追加・削除）を実装する。
 package raft
 
 import (
@@ -37,8 +38,13 @@ type ApplyFunc func(index uint64, command []byte) (any, error)
 type Config struct {
 	ID      string            // 自ノードの ID（例: "node-0"）
 	Addr    string            // 自ノードの広報アドレス（リーダーヒント用）
-	Peers   map[string]string // 自分以外のノード: ID -> アドレス
+	Peers   map[string]string // 自分以外のノード: ID -> アドレス（ブートストラップ構成）
 	DataDir string            // meta / ログの永続化先ディレクトリ
+
+	// Join を true にすると、リーダーから自分を含むクラスタ構成
+	// （AddMember による設定変更エントリ）を受け取るまで選挙を起こさない。
+	// 既存クラスタに新しいノードを追加するときに使う。
+	Join bool
 
 	ElectionTimeoutMin time.Duration // デフォルト 300ms
 	ElectionTimeoutMax time.Duration // デフォルト 600ms
@@ -68,7 +74,15 @@ type Node struct {
 
 	id    string
 	addr  string
-	peers map[string]string
+	peers map[string]string // 自分以外の現メンバー: ID -> アドレス（members から導出）
+
+	// メンバーシップ（動的に変わる）。members は自分を含む全メンバー。
+	// 設定変更エントリはコミットを待たず、ログに追記された時点で有効になる（論文 §4.1）。
+	members          map[string]string
+	bootstrapMembers map[string]string // 起動フラグ由来の初期構成（ログ切り捨て時のフォールバック）
+	snapMembers      map[string]string // スナップショット境界時点の構成
+	configIndex      uint64            // 現在有効な設定変更エントリのインデックス（なければ 0）
+	joining          bool              // Join モードで構成に加わるのを待っている間 true
 
 	state       State
 	currentTerm uint64
@@ -80,8 +94,12 @@ type Node struct {
 	lastApplied uint64
 
 	// リーダーのみ使用
-	nextIndex  map[string]uint64
-	matchIndex map[string]uint64
+	nextIndex      map[string]uint64
+	matchIndex     map[string]uint64
+	termStartIndex uint64 // 現 term の no-op エントリのインデックス（ReadIndex 用）
+
+	// ReadIndex などで lastApplied の前進を待つためのウェイター
+	applyWaiters []applyWaiter
 
 	electionReset   time.Time
 	electionTimeout time.Duration
@@ -140,21 +158,47 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	// スナップショットがあればその境界からログを復元する
 	var snapIndex, snapTerm uint64
+	var snapMembers map[string]string
 	if snap, err := LoadSnapshot(cfg.DataDir); err != nil {
 		return nil, err
 	} else if snap != nil {
 		snapIndex, snapTerm = snap.Index, snap.Term
+		snapMembers = snap.Members
 	}
 	lg, err := OpenLog(filepath.Join(cfg.DataDir, "raft-log.jsonl"), snapIndex, snapTerm)
 	if err != nil {
 		return nil, err
 	}
 
+	// クラスタ構成の復元: ブートストラップ構成（フラグ由来）を、
+	// スナップショット → ログ上の最新の設定変更エントリの順で上書きする
+	bootstrap := map[string]string{cfg.ID: cfg.Addr}
+	for id, addr := range cfg.Peers {
+		bootstrap[id] = addr
+	}
+	members := copyMembers(bootstrap)
+	var configIndex uint64
+	if len(snapMembers) > 0 {
+		members = copyMembers(snapMembers)
+		configIndex = snapIndex
+	}
+	if e, ok := lg.LatestConfig(); ok {
+		m, err := decodeMembers(e.Command)
+		if err != nil {
+			return nil, fmt.Errorf("decode config entry %d: %w", e.Index, err)
+		}
+		members = m
+		configIndex = e.Index
+	}
+
+	peers := peersOf(members, cfg.ID)
 	trans := cfg.Transport
 	ownTrans := false
 	if trans == nil {
-		trans = NewGRPCTransport(cfg.Peers)
+		trans = NewGRPCTransport(peers)
 		ownTrans = true
+	} else if pu, ok := trans.(PeerUpdater); ok {
+		pu.UpdatePeers(peers)
 	}
 
 	// スナップショットの方が進んでいる場合はそちらに合わせる
@@ -166,7 +210,12 @@ func NewNode(cfg Config) (*Node, error) {
 	n := &Node{
 		id:                 cfg.ID,
 		addr:               cfg.Addr,
-		peers:              cfg.Peers,
+		peers:              peers,
+		members:            members,
+		bootstrapMembers:   bootstrap,
+		snapMembers:        snapMembers,
+		configIndex:        configIndex,
+		joining:            cfg.Join,
 		state:              Follower,
 		currentTerm:        m.Term,
 		votedFor:           m.VotedFor,
@@ -225,6 +274,15 @@ func (n *Node) randTimeout() time.Duration {
 func (n *Node) clusterSize() int { return len(n.peers) + 1 }
 func (n *Node) majority() int    { return n.clusterSize()/2 + 1 }
 
+// MemberInfo はクラスタメンバー 1 台分の情報。
+type MemberInfo struct {
+	ID   string
+	Addr string
+	// リーダーが把握している複製済みインデックス。リーダーの応答でのみ意味を
+	// 持ち、自ノード分はログ末尾が入る。
+	MatchIndex uint64
+}
+
 // Status はノードの現在状態のスナップショットを返す。
 type Status struct {
 	ID             string
@@ -234,15 +292,29 @@ type Status struct {
 	LeaderAddr     string
 	CommitIndex    uint64
 	AppliedIndex   uint64
+	LastLogIndex   uint64
 	SnapshotIndex  uint64 // ログコンパクション済みの境界（なければ 0）
 	ElectionsTotal uint64
 	Peers          int
+	Members        []MemberInfo // ID 順
 }
 
 // GetStatus は現在の状態を返す。
 func (n *Node) GetStatus() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	members := make([]MemberInfo, 0, len(n.members))
+	for _, id := range memberIDs(n.members) {
+		mi := MemberInfo{ID: id, Addr: n.members[id]}
+		if n.state == Leader {
+			if id == n.id {
+				mi.MatchIndex = n.log.LastIndex()
+			} else {
+				mi.MatchIndex = n.matchIndex[id]
+			}
+		}
+		members = append(members, mi)
+	}
 	return Status{
 		ID:             n.id,
 		State:          n.state,
@@ -251,9 +323,11 @@ func (n *Node) GetStatus() Status {
 		LeaderAddr:     n.leaderAddrLocked(),
 		CommitIndex:    n.commitIndex,
 		AppliedIndex:   n.lastApplied,
+		LastLogIndex:   n.log.LastIndex(),
 		SnapshotIndex:  n.log.SnapIndex(),
 		ElectionsTotal: n.electionsTotal,
 		Peers:          n.clusterSize(),
+		Members:        members,
 	}
 }
 
@@ -335,12 +409,67 @@ func (n *Node) tick() {
 		}
 	default:
 		if time.Since(n.electionReset) >= n.electionTimeout {
-			n.startElectionLocked()
+			n.startPreVoteLocked()
 		}
 	}
 }
 
 // ---- リーダー選出 ----
+
+// startPreVoteLocked は本選挙の前に pre-vote（事前投票、論文 §9.6）を行う。
+// term を上げず votedFor も変えないため、ネットワーク分断から復帰したノードが
+// 意味もなく term を上げて現リーダーを退任させるのを防げる。
+// 過半数から「その term なら投票する」と返ってきた場合のみ本選挙に進む。
+func (n *Node) startPreVoteLocked() {
+	n.electionReset = time.Now()
+	n.electionTimeout = n.randTimeout()
+	if n.joining {
+		return // クラスタ構成に加わるまで選挙を起こさない
+	}
+	if _, ok := n.members[n.id]; !ok {
+		return // 構成から除去されたノードは選挙を起こさない
+	}
+	if n.clusterSize() == 1 {
+		n.startElectionLocked()
+		return
+	}
+	term := n.currentTerm
+	n.logger.Info("starting pre-vote", "term", term)
+	req := &raftpb.RequestVoteRequest{
+		Term:         term + 1, // 本選挙で使うことになる term（実際にはまだ上げない）
+		CandidateId:  n.id,
+		LastLogIndex: n.log.LastIndex(),
+		LastLogTerm:  n.log.LastTerm(),
+		PreVote:      true,
+	}
+	votes := 1
+	for peerID := range n.peers {
+		go func(peerID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), n.electionTimeoutMin)
+			defer cancel()
+			resp, err := n.trans.RequestVote(ctx, peerID, req)
+			if err != nil {
+				return
+			}
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			if resp.Term > n.currentTerm {
+				n.becomeFollowerLocked(resp.Term)
+				return
+			}
+			// pre-vote 開始時から状況が変わっていたら結果を破棄
+			if n.state == Leader || n.currentTerm != term || !resp.VoteGranted {
+				return
+			}
+			votes++
+			if votes >= n.majority() {
+				// startElectionLocked が term を上げるので、残りの応答は
+				// 上の currentTerm != term チェックで破棄される
+				n.startElectionLocked()
+			}
+		}(peerID)
+	}
+}
 
 func (n *Node) startElectionLocked() {
 	n.state = Candidate
@@ -405,11 +534,13 @@ func (n *Node) becomeLeaderLocked() {
 	}
 	n.logger.Info("became leader", "term", n.currentTerm)
 
-	// 現 term のエントリをコミットできるようにするための no-op エントリ
+	// 現 term のエントリをコミットできるようにするための no-op エントリ。
+	// このインデックスは ReadIndex の下限（termStartIndex）にもなる。
 	noop := Entry{Term: n.currentTerm, Index: n.log.LastIndex() + 1}
 	if err := n.log.Append(noop); err != nil {
 		n.logger.Error("failed to append no-op entry", "err", err)
 	}
+	n.termStartIndex = noop.Index
 	n.advanceCommitLocked()
 	n.lastHeartbeat = time.Now()
 	n.broadcastAppendLocked()
@@ -472,7 +603,7 @@ func (n *Node) sendAppend(peerID string, term uint64) {
 		LeaderCommit: n.commitIndex,
 	}
 	for _, e := range n.log.From(next) {
-		req.Entries = append(req.Entries, &raftpb.LogEntry{Term: e.Term, Index: e.Index, Command: e.Command})
+		req.Entries = append(req.Entries, &raftpb.LogEntry{Term: e.Term, Index: e.Index, Command: e.Command, Type: e.Type})
 	}
 	n.mu.Unlock()
 
@@ -535,6 +666,14 @@ func (n *Node) sendSnapshot(peerID string, term uint64) {
 		LastIncludedTerm:  snap.Term,
 		Data:              snap.Data,
 	}
+	if len(snap.Members) > 0 {
+		b, err := encodeMembers(snap.Members)
+		if err != nil {
+			n.logger.Error("failed to encode snapshot members", "err", err)
+			return
+		}
+		req.Members = b
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -573,6 +712,9 @@ func (n *Node) maybeSnapshot() {
 		return
 	}
 	term := n.log.TermAt(idx)
+	// スナップショットに埋め込む構成。厳密には idx 時点の構成を使うべきだが、
+	// 追記済み・未コミットの設定変更が重なる稀な窓は許容する（学習用の簡略化）
+	members := copyMembers(n.members)
 	n.mu.Unlock()
 	if term == 0 {
 		return
@@ -591,10 +733,11 @@ func (n *Node) maybeSnapshot() {
 	if idx <= n.log.SnapIndex() { // InstallSnapshot で先にコンパクション済み
 		return
 	}
-	if err := SaveSnapshot(n.dataDir, &Snapshot{Index: idx, Term: term, Data: data}); err != nil {
+	if err := SaveSnapshot(n.dataDir, &Snapshot{Index: idx, Term: term, Data: data, Members: members}); err != nil {
 		n.logger.Error("failed to save snapshot", "err", err)
 		return
 	}
+	n.snapMembers = members
 	if err := n.log.CompactTo(idx, term); err != nil {
 		n.logger.Error("failed to compact raft log", "err", err)
 		return
@@ -637,6 +780,28 @@ func (n *Node) signalApply() {
 func (n *Node) handleRequestVote(req *raftpb.RequestVoteRequest) *raftpb.RequestVoteResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// pre-vote: 自分の状態（term / votedFor / タイマー）を一切変えずに、
+	// 「その term で本選挙が来たら投票するか」だけを答える。
+	if req.PreVote {
+		resp := &raftpb.RequestVoteResponse{Term: n.currentTerm}
+		if req.Term <= n.currentTerm {
+			return resp // 候補者が使おうとしている term がすでに古い
+		}
+		if n.state == Leader {
+			return resp // 自分がリーダーとして機能している間は拒否
+		}
+		// 現リーダーのハートビートを受け取れているなら拒否（leader stickiness）。
+		// これにより一方向断のノードが健全なリーダーを乱すのを防ぐ。
+		if n.leaderID != "" && time.Since(n.electionReset) < n.electionTimeoutMin {
+			return resp
+		}
+		if req.LastLogTerm > n.log.LastTerm() ||
+			(req.LastLogTerm == n.log.LastTerm() && req.LastLogIndex >= n.log.LastIndex()) {
+			resp.VoteGranted = true
+		}
+		return resp
+	}
 
 	if req.Term > n.currentTerm {
 		n.becomeFollowerLocked(req.Term)
@@ -689,7 +854,7 @@ func (n *Node) handleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 
 	// エントリの追記（term が食い違うエントリ以降は切り捨てて上書き）
 	for _, pe := range req.Entries {
-		e := Entry{Term: pe.Term, Index: pe.Index, Command: pe.Command}
+		e := Entry{Term: pe.Term, Index: pe.Index, Command: pe.Command, Type: pe.Type}
 		switch {
 		case e.Index <= n.log.SnapIndex():
 			// スナップショットでカバー済み（コミット済みなので一致が保証される）
@@ -700,12 +865,18 @@ func (n *Node) handleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 				n.logger.Error("failed to truncate raft log", "err", err)
 				return resp
 			}
+			// 現在の構成を決めていたエントリごと切り捨てた場合は構成を引き直す
+			if e.Index <= n.configIndex {
+				n.recomputeConfigLocked()
+			}
 			fallthrough
 		default:
 			if err := n.log.Append(e); err != nil {
 				n.logger.Error("failed to append raft log", "err", err)
 				return resp
 			}
+			// 設定変更エントリはコミットを待たず追記した時点で有効になる
+			n.maybeApplyConfigEntryLocked(e)
 		}
 	}
 
@@ -750,7 +921,16 @@ func (n *Node) handleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 
 	// 先に自分のスナップショットとして永続化してから状態を置き換える。
 	// 途中でクラッシュしても再起動時にスナップショットから復元できる。
-	snap := &Snapshot{Index: req.LastIncludedIndex, Term: req.LastIncludedTerm, Data: req.Data}
+	var snapMembers map[string]string
+	if len(req.Members) > 0 {
+		m, err := decodeMembers(req.Members)
+		if err != nil {
+			n.logger.Error("failed to decode snapshot members", "err", err)
+			return resp
+		}
+		snapMembers = m
+	}
+	snap := &Snapshot{Index: req.LastIncludedIndex, Term: req.LastIncludedTerm, Data: req.Data, Members: snapMembers}
 	if err := SaveSnapshot(n.dataDir, snap); err != nil {
 		n.logger.Error("failed to save received snapshot", "err", err)
 		return resp
@@ -764,6 +944,13 @@ func (n *Node) handleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 	}
 	n.commitIndex = req.LastIncludedIndex
 	n.lastApplied = req.LastIncludedIndex
+	n.notifyApplyWaitersLocked()
+	if len(snapMembers) > 0 {
+		n.snapMembers = snapMembers
+		if req.LastIncludedIndex >= n.configIndex {
+			n.applyConfigLocked(snapMembers, req.LastIncludedIndex)
+		}
+	}
 	n.logger.Info("installed snapshot from leader",
 		"leader", req.LeaderId, "index", req.LastIncludedIndex, "term", req.LastIncludedTerm)
 	return resp
@@ -785,22 +972,33 @@ func (n *Node) applyLoop() {
 				n.mu.Unlock()
 				break
 			}
-			n.lastApplied++
-			idx := n.lastApplied
+			idx := n.lastApplied + 1
 			entry, ok := n.log.At(idx)
 			waiter := n.waiters[idx]
 			delete(n.waiters, idx)
-			n.mu.Unlock()
 			if !ok {
+				n.lastApplied = idx
+				n.notifyApplyWaitersLocked()
+				n.mu.Unlock()
 				n.logger.Error("committed entry missing from log", "index", idx)
 				continue
 			}
+			n.mu.Unlock()
 
 			var res any
 			var err error
-			if len(entry.Command) > 0 {
+			// 設定変更エントリは追記時に反映済みなのでステートマシンには適用しない
+			if entry.Type == EntryNormal && len(entry.Command) > 0 {
 				res, err = n.applyFn(idx, entry.Command)
 			}
+			// lastApplied はステートマシンへの適用が完了してから進める
+			// （ReadIndex は lastApplied 到達 = 読める、を当てにしている）
+			n.mu.Lock()
+			if idx > n.lastApplied {
+				n.lastApplied = idx
+			}
+			n.notifyApplyWaitersLocked()
+			n.mu.Unlock()
 			if waiter != nil {
 				waiter <- applyResult{res: res, err: err}
 			}

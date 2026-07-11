@@ -4,12 +4,32 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/noda/linkraft/proto/raftpb"
 )
+
+// DialOptions は KVS ノード間 / クライアントの gRPC 接続オプション。
+// デフォルトの再接続バックオフは最大 2 分まで伸びるため、落ちたノードが
+// 復帰してもしばらく到達できなくなる。数秒で再接続を試みるよう上限を短くする。
+func DialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  200 * time.Millisecond,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   2 * time.Second,
+			},
+			MinConnectTimeout: 2 * time.Second,
+		}),
+	}
+}
 
 // Transport はピアへの Raft RPC 送信を抽象化する。
 type Transport interface {
@@ -17,6 +37,12 @@ type Transport interface {
 	AppendEntries(ctx context.Context, peerID string, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error)
 	InstallSnapshot(ctx context.Context, peerID string, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error)
 	Close() error
+}
+
+// PeerUpdater はメンバーシップ変更に追従できる Transport が実装する。
+// Node は構成が変わるたびに新しいピア表（自分以外の id -> addr）を渡す。
+type PeerUpdater interface {
+	UpdatePeers(peerAddrs map[string]string)
 }
 
 // GRPCTransport は gRPC ベースの Transport 実装。
@@ -46,12 +72,30 @@ func (t *GRPCTransport) client(peerID string) (raftpb.RaftClient, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown peer: %s", peerID)
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, DialOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("dial peer %s: %w", peerID, err)
 	}
 	t.conns[peerID] = conn
 	return raftpb.NewRaftClient(conn), nil
+}
+
+// UpdatePeers はピアのアドレス表を差し替える（メンバーシップ変更用）。
+// 除去された、またはアドレスが変わったピアへの接続は閉じる。
+func (t *GRPCTransport) UpdatePeers(peerAddrs map[string]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	addrs := make(map[string]string, len(peerAddrs))
+	for id, a := range peerAddrs {
+		addrs[id] = a
+	}
+	for id, conn := range t.conns {
+		if addr, ok := addrs[id]; !ok || addr != t.addrs[id] {
+			conn.Close()
+			delete(t.conns, id)
+		}
+	}
+	t.addrs = addrs
 }
 
 // RequestVote は投票依頼 RPC を送る。

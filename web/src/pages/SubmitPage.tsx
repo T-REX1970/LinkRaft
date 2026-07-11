@@ -1,8 +1,9 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 
 import { api } from "../api";
 import { useAuth } from "../auth";
+import type { Tag } from "../types";
 import { usePageTitle } from "../usePageTitle";
 
 export default function SubmitPage() {
@@ -14,13 +15,49 @@ export default function SubmitPage() {
   const [description, setDescription] = useState("");
   const [imageURL, setImageURL] = useState("");
   const [tagsInput, setTagsInput] = useState("");
+  const [allTags, setAllTags] = useState<Tag[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [fetching, setFetching] = useState(false);
 
   usePageTitle("リンクを投稿");
 
+  // 既存タグをサジェスト用に読み込む（失敗しても投稿には影響しない）
+  useEffect(() => {
+    api
+      .listTags()
+      .then((res) => setAllTags(res.tags ?? []))
+      .catch(() => {});
+  }, []);
+
   if (!user) return <Navigate to="/login" replace />;
+
+  // 入力中の最後のトークン（区切り文字で終わっていれば空 = 新しいタグの入力待ち）
+  const endsWithSep = /[,\s]$/.test(tagsInput);
+  const tokens = tagsInput
+    .split(/[,\s]+/)
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+  const editing = endsWithSep || tokens.length === 0 ? "" : tokens[tokens.length - 1];
+  const chosen = new Set(editing ? tokens.slice(0, -1) : tokens);
+  const suggestions = allTags
+    .filter(
+      (t) =>
+        !chosen.has(t.name) &&
+        t.name !== editing &&
+        (editing === "" || t.name.startsWith(editing)),
+    )
+    .slice(0, 8);
+
+  // サジェストされたタグで入力中のトークンを補完（または末尾に追加）する
+  const pickTag = (name: string) => {
+    const base = editing
+      ? tagsInput.replace(/[^,\s]+$/, "")
+      : tagsInput && !endsWithSep
+        ? tagsInput + " "
+        : tagsInput;
+    setTagsInput(base + name + " ");
+  };
 
   // URL から OGP を取得してタイトル・説明・サムネイルをプリフィルする
   const prefill = async () => {
@@ -113,6 +150,20 @@ export default function SubmitPage() {
             placeholder="go raft distributed-systems"
           />
         </label>
+        {suggestions.length > 0 && (
+          <div className="tag-suggest">
+            {suggestions.map((t) => (
+              <button
+                key={t.name}
+                type="button"
+                className="tag-suggest-item"
+                onClick={() => pickTag(t.name)}
+              >
+                {t.name} <span className="count">{t.count}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {imageURL && (
           <div className="thumb-preview">
             <img

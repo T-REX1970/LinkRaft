@@ -16,6 +16,9 @@ message LogEntry {
   uint64 term = 1;
   uint64 index = 2;
   bytes command = 3;
+  // 0 = 通常のコマンド / no-op、1 = メンバーシップ変更（command は
+  // 全メンバーの id -> addr マップの JSON）
+  uint32 type = 4;
 }
 
 message RequestVoteRequest {
@@ -23,6 +26,9 @@ message RequestVoteRequest {
   string candidate_id = 2;
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  // pre-vote（事前投票）: term を上げる前の打診。受信側は term / votedFor /
+  // 選挙タイマーを一切変更せずに、投票するかどうかだけを答える。
+  bool pre_vote = 5;
 }
 
 message RequestVoteResponse {
@@ -54,6 +60,9 @@ message InstallSnapshotRequest {
   uint64 last_included_index = 3;
   uint64 last_included_term = 4;
   bytes data = 5;
+  // スナップショット時点のクラスタ構成（全メンバーの id -> addr マップの JSON）。
+  // 空なら構成情報なし（旧形式）。
+  bytes members = 6;
 }
 
 message InstallSnapshotResponse {

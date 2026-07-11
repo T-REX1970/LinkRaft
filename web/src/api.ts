@@ -10,6 +10,7 @@ import type {
   Link,
   LinkListResponse,
   OGPResponse,
+  Tag,
   UserProfileResponse,
 } from "./types";
 
@@ -139,4 +140,10 @@ export const api = {
     request<UserProfileResponse>("GET", `/api/users/${id}`),
   fetchOGP: (url: string) => request<OGPResponse>("POST", "/api/ogp", { url }),
   health: () => request<HealthResponse>("GET", "/api/health"),
+  listTags: () => request<{ tags: Tag[] | null }>("GET", "/api/tags"),
+
+  addClusterMember: (id: string, addr: string) =>
+    request<{ ok: boolean }>("POST", "/api/cluster/members", { id, addr }),
+  removeClusterMember: (id: string) =>
+    request<{ ok: boolean }>("DELETE", `/api/cluster/members/${id}`),
 };

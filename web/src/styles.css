@@ -429,21 +429,149 @@ textarea:focus {
 }
 
 /* クラスタ状態 */
-.health-table {
-  width: 100%;
-  border-collapse: collapse;
+.cluster-summary {
+  color: var(--muted);
+}
+.node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+  margin: 14px 0 22px;
+}
+.node-card {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
-.health-table th,
-.health-table td {
-  text-align: left;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
+.node-card.leader {
+  border-color: var(--state-leader-fg);
 }
-.health-table tr:last-child td {
-  border-bottom: none;
+.node-card.down {
+  opacity: 0.65;
+}
+.node-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.node-id {
+  font-weight: 700;
+}
+.node-addr {
+  color: var(--muted);
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.node-removed {
+  color: var(--state-down-fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+.node-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+}
+.node-stats div {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.node-stats dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.node-stats dd {
+  margin: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.repl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.repl-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--tag-bg);
+  overflow: hidden;
+}
+.repl-fill {
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.4s ease;
+}
+.repl-fill.full {
+  background: var(--state-leader-fg);
+}
+.repl-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.danger-text {
+  color: var(--danger);
+}
+.member-form {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-top: 8px;
+}
+.member-form h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+.member-form .hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 10px;
+}
+.member-form form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.member-form input {
+  flex: 1;
+  min-width: 180px;
+}
+.info {
+  color: var(--state-leader-fg);
+}
+
+/* タグサジェスト（投稿フォーム） */
+.tag-suggest {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -6px 0 4px;
+}
+.tag-suggest-item {
+  border: 1px solid var(--border);
+  background: var(--tag-bg);
+  color: var(--primary-text);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.tag-suggest-item:hover {
+  border-color: var(--primary);
+}
+.tag-suggest-item .count {
+  color: var(--muted);
+  font-size: 12px;
 }
 .state {
   border-radius: 4px;

@@ -45,6 +45,7 @@ func NewRouter(h *handler.Handler, jwtSecret []byte, webDir string) *echo.Echo {
 	pub.GET("/users/:id", h.GetUser)
 	pub.POST("/ogp", h.FetchOGP)
 	pub.GET("/health", h.Health)
+	pub.GET("/tags", h.ListTags)
 
 	auth := e.Group("/api", middleware.JWT(jwtSecret))
 	auth.POST("/links", h.CreateLink)
@@ -52,6 +53,10 @@ func NewRouter(h *handler.Handler, jwtSecret []byte, webDir string) *echo.Echo {
 	auth.POST("/links/:id/vote", h.ToggleVote)
 	auth.POST("/links/:id/comments", h.CreateComment)
 	auth.DELETE("/comments/:id", h.DeleteComment)
+	// クラスタ管理（メンバーシップ変更）。学習用アプリなのでログインユーザーなら
+	// 誰でも操作できる（実運用なら管理者権限で保護する）
+	auth.POST("/cluster/members", h.AddClusterMember)
+	auth.DELETE("/cluster/members/:id", h.RemoveClusterMember)
 
 	return e
 }
